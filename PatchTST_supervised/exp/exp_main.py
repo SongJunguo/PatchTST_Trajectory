@@ -150,8 +150,6 @@ class Exp_Main(Exp_Basic):
                 loss = criterion(pred, true)
 
                 total_loss.append(loss.item())
-                del batch_x, batch_y, batch_x_mark, batch_y_mark, dec_inp, outputs, pred, true, loss
-                torch.cuda.empty_cache()
         total_loss = np.average(total_loss)
         self.model.train()
         return total_loss
@@ -264,8 +262,6 @@ class Exp_Main(Exp_Basic):
                     adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
                     scheduler.step()
                 
-                del batch_x, batch_y, batch_x_mark, batch_y_mark, dec_inp, outputs, loss
-                torch.cuda.empty_cache()
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
@@ -284,6 +280,8 @@ class Exp_Main(Exp_Basic):
                 adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args)
             else:
                 print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
+
+            torch.cuda.empty_cache()
 
         best_model_path = path + '/' + 'checkpoint.pth'
         checkpoint = torch.load(best_model_path)
