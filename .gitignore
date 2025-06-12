@@ -32,6 +32,10 @@ tramp
 *.png
 *.csv
 *.parquet
+*.txt
+*.pth
+*.npy
+*.sh
 # AUCTeX auto folder
 /auto/
 

@@ -281,7 +281,7 @@ class Exp_Main(Exp_Basic):
             else:
                 print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
 
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
 
         best_model_path = path + '/' + 'checkpoint.pth'
         checkpoint = torch.load(best_model_path)
