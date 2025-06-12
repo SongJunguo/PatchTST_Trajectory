@@ -471,3 +471,23 @@ $RECYCLE.BIN/
 *.lnk
 
 # End of https://www.toptal.com/developers/gitignore/api/emacs,jetbrains+all,jupyternotebooks,linux,macos,microsoftoffice,notepadpp,python,tortoisegit,vim,visualstudiocode,windows
+
+# Project specific large files and directories
+PatchTST_supervised/results/
+PatchTST_supervised/dataset/
+PatchTST_supervised/checkpoints/
+PatchTST_supervised/logs/
+PatchTST_supervised/test_results/
+
+# Large data files
+*.csv
+*.parquet
+*.npy
+*.pth
+*.h5
+*.hdf5
+
+# Temporary and backup files
+*.tmp
+*.bak
+*~
