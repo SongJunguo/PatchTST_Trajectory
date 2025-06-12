@@ -92,7 +92,7 @@ def _filter_duration_worker(df, min_duration_minutes=15):
     print(f"已过滤掉过短的轨迹: {unique_id} (持续时间: {duration})")
     return None
 
-def _filter_military_worker(df, lon_threshold=200.0, lat_threshold=200.0):
+def _filter_military_worker(df, lon_threshold=2.0, lat_threshold=2.0):
     """工作函数：根据位移过滤单个轨迹（疑似军航）。"""
     if len(df) < 2: return None
     start_point = df.iloc[0]
@@ -315,7 +315,7 @@ def filter_short_trajectories(segments, min_duration_minutes=15, max_workers=16)
     worker = partial(_filter_duration_worker, min_duration_minutes=min_duration_minutes)
     return _parallel_executor(worker, segments, max_workers)
 
-def filter_military_flights(segments, lon_threshold=200.0, lat_threshold=200.0, max_workers=16):
+def filter_military_flights(segments, lon_threshold=2.0, lat_threshold=2.0, max_workers=16):
     """并行地过滤疑似军航的轨迹。"""
     worker = partial(_filter_military_worker, lon_threshold=lon_threshold, lat_threshold=lat_threshold)
     return _parallel_executor(worker, segments, max_workers)

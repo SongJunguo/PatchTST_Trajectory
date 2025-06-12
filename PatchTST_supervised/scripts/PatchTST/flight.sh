@@ -36,7 +36,7 @@ python -u run_longExp.py \
   --is_training 1 \
   --root_path ./dataset/ \
   --data_path processed_trajectories_multi.csv \
-  --model_id 20250612flight_dependent \
+  --model_id 20250612flight_dependent_test \
   --model PatchTST \
   --data flight \
   --features M \
