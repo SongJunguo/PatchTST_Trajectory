@@ -1,3 +1,9 @@
+PatchTST_supervised/data_provider/TEMP.md
+有一个详细的计划书，你县阅读这个计划书和相关代码
+PatchTST_supervised/data_provider/run_preprocessing.sh
+PatchTST_supervised/data_provider/flight_data_preprocessor_multi.py
+
+使用conda 虚拟环境 conda activate dl_data_env
 # **最终执行手册：高性能飞行数据预处理器**
 
 **版本：4.0 (交接最终版)**
@@ -101,6 +107,9 @@
         *   **必须** 用 `try-except Exception as e:` 包裹所有核心逻辑。
         *   在 `try` 块中，用 `.to_numpy()` 将列转为 NumPy 数组，传递给 `savgol_filter`, `LocalOutlierFactor` 等。
         *   在 `except` 块中，**必须** 记录失败的 `Unique_ID` 和错误 `e`，然后 `return pl.DataFrame(schema=group_df.schema)` 返回一个 **空的、但具有正确 Schema 的 DataFrame**。
+    *   **关于 `detect_height_anomalies` 的特别说明:**
+        *   **决策:** 此函数将 **按原样从旧脚本中复制**。
+        *   **理由:** 该函数接收 NumPy 数组作为输入，其内部逻辑（虽然复杂）是自包含的。在 Polars 的 UDF 中，我们可以通过 `.to_numpy()` 高效地将列转换为 NumPy 数组，然后调用此函数。其返回的布尔掩码 (mask) 也可以轻松地用于更新 Polars DataFrame。将其重写为纯 Polars 表达式将非常复杂且没有明显的性能优势。因此，保持其不变是风险最低、最高效的集成方式。
 
 4.  **输出 (`阶段四`)**
     *   **默认输出 CSV。**
