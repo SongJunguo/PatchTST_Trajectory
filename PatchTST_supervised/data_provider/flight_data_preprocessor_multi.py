@@ -82,16 +82,27 @@ def _process_trajectory_group_worker(group_df, ground_altitude_threshold=300):
     return all_segments
 
 def _filter_duration_worker(df, min_duration_minutes=15):
-    """工作函数：根据持续时间过滤单个轨迹。"""
-    min_duration = timedelta(minutes=min_duration_minutes)
-    if len(df) < 2: return None
-    start_time = pd.to_datetime(df.iloc[0]['Time'])
-    end_time = pd.to_datetime(df.iloc[-1]['Time'])
-    duration = end_time - start_time
-    if duration >= min_duration: return df
-    unique_id = df['Unique_ID'].iloc[0]
-    print(f"已过滤掉过短的轨迹: {unique_id} (持续时间: {duration})")
-    return None
+    """工作函数：根据持续时间过滤单个轨迹（已添加异常处理）。"""
+    try:
+        min_duration = timedelta(minutes=min_duration_minutes)
+        if df is None or len(df) < 2:
+            return None
+        
+        start_time = pd.to_datetime(df.iloc[0]['Time'])
+        end_time = pd.to_datetime(df.iloc[-1]['Time'])
+        duration = end_time - start_time
+        
+        if duration >= min_duration:
+            return df
+        
+        unique_id = df['Unique_ID'].iloc[0]
+        print(f"已过滤掉过短的轨迹: {unique_id} (持续时间: {duration})")
+        return None
+    except Exception as e:
+        # 在多进程中，这个打印操作可以帮助我们定位到导致崩溃的具体数据块
+        unique_id = df['Unique_ID'].iloc[0] if 'Unique_ID' in df.columns and not df.empty else "Unknown ID"
+        print(f"--- 工作进程错误: 在过滤时长时处理轨迹 {unique_id} 失败。原因: {e} ---")
+        return None
 
 def _filter_military_worker(df, lon_threshold=2.0, lat_threshold=2.0):
     """工作函数：根据位移过滤单个轨迹（疑似军航）。"""
@@ -245,8 +256,8 @@ def load_and_process_files(directory_path, output_directory):
             df_list.append(df)
         except UnicodeDecodeError:
             try:
-                print(f"文件 {os.path.basename(file)} 使用UTF-8解码失败，正在尝试GBK...")
-                df = pd.read_csv(file, encoding='gbk', low_memory=False)
+                print(f"文件 {os.path.basename(file)} 使用GBK解码失败，正在尝试UTF-8...")
+                df = pd.read_csv(file, encoding='utf-8', low_memory=False)
                 df_list.append(df)
             except Exception as e:
                 print(f"无法使用UTF-8或GBK读取文件 {os.path.basename(file)}。错误: {e}")
@@ -274,6 +285,14 @@ def load_and_process_files(directory_path, output_directory):
     full_df.dropna(subset=['ID', 'H', 'Lon', 'Lat', 'Time'], inplace=True)
     df = full_df[['ID', 'H', 'Lon', 'Lat', 'Time']].copy()
     df['Time'] = df['Time'].dt.strftime('%Y%m%d %H:%M:%S.%f').str[:-3]
+
+    # --- 新增功能: 根据用户反馈，在此处保存包含5个核心列的中间文件 ---
+    if not df.empty:
+        intermediate_filename = os.path.join(output_directory, "_01_initial_parsed_data.csv")
+        print(f"\n--- 正在保存初始解析和转换后的数据到 {intermediate_filename} ---")
+        df.to_csv(intermediate_filename, index=False, encoding='utf-8-sig')
+        print(f"--- 初始数据保存成功，共 {len(df)} 行。---\n")
+
     return df
 
 def filter_by_geographic_and_altitude_range(df):
