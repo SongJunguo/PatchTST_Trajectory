@@ -54,7 +54,7 @@ def _process_trajectory_group_worker(group_df, ground_altitude_threshold=300):
     split_indices = []
     for i in range(1, len(df_sorted)):
         time_diff = pd.to_datetime(df_sorted.loc[i, 'Time']) - pd.to_datetime(df_sorted.loc[i-1, 'Time'])
-        if time_diff > timedelta(minutes=10):
+        if time_diff > timedelta(minutes=15):
             # if df_sorted.loc[i-1, 'H'] < ground_altitude_threshold and df_sorted.loc[i, 'H'] < ground_altitude_threshold:
             #     split_indices.append(i)
             split_indices.append(i)
@@ -134,7 +134,7 @@ def _interpolate_and_smooth_worker(segment_df):
         if resampled_df.empty: return None
 
         X = resampled_df[features].values
-        lof = LocalOutlierFactor(n_neighbors=20, contamination=0.05)
+        lof = LocalOutlierFactor(n_neighbors=50, contamination=0.05)
         outlier_mask = lof.fit_predict(X)
         resampled_df.loc[outlier_mask == -1, features] = np.nan
         resampled_df[features] = resampled_df[features].interpolate(method='linear')
@@ -284,7 +284,7 @@ def filter_by_geographic_and_altitude_range(df):
     print("\n--- 新增阶段: 开始基于地理和高度范围的过滤 ---")
     
     # 定义范围
-    H_MIN, H_MAX = 0, 10000
+    H_MIN, H_MAX = 0, 20000
     LON_MIN, LON_MAX = 110, 120
     LAT_MIN, LAT_MAX = 33, 42
     
@@ -410,7 +410,7 @@ if __name__ == '__main__':
     # --- 配置路径 ---
     INPUT_DIR = './dataset/raw/'
     OUTPUT_DIR = './dataset/processed_data/'
-    
+    pd.set_option('future.no_silent_downcasting', True)
     # --- 配置并行处理 ---
     # 根据您的要求，固定使用16个工作进程。
     MAX_WORKERS = 16
