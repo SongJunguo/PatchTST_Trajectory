@@ -296,25 +296,23 @@ def load_and_process_files(directory_path, output_directory):
 
     return df
 
-def filter_by_geographic_and_altitude_range(df):
+def filter_by_geographic_and_altitude_range(df, h_min, h_max, lon_min, lon_max, lat_min, lat_max):
     """
     新增阶段：根据地理和高度范围过滤轨迹。
     只删除超出范围的数据行，而不是整个ID。
     """
     print("\n--- 新增阶段: 开始基于地理和高度范围的过滤 ---")
     
-    # 定义范围
-    H_MIN, H_MAX = 0, 20000
-    LON_MIN, LON_MAX = 110, 120
-    LAT_MIN, LAT_MAX = 33, 42
+    # 使用从命令行传入的参数
+    print(f"--- 过滤参数: H=[{h_min}, {h_max}], Lon=[{lon_min}, {lon_max}], Lat=[{lat_min}, {lat_max}] ---")
     
     initial_rows = len(df)
 
     # 保留在范围内的行
     filtered_df = df[
-        (df['H'] >= H_MIN) & (df['H'] <= H_MAX) &
-        (df['Lon'] >= LON_MIN) & (df['Lon'] <= LON_MAX) &
-        (df['Lat'] >= LAT_MIN) & (df['Lat'] <= LAT_MAX)
+        (df['H'] >= h_min) & (df['H'] <= h_max) &
+        (df['Lon'] >= lon_min) & (df['Lon'] <= lon_max) &
+        (df['Lat'] >= lat_min) & (df['Lat'] <= lat_max)
     ].copy()
     
     final_rows = len(filtered_df)
@@ -378,7 +376,8 @@ def interpolate_and_smooth(trajectory_segments, max_workers=16):
     """第三阶段：数据插值与平滑 (并行版)"""
     return _parallel_executor(_interpolate_and_smooth_worker, trajectory_segments, max_workers)
 
-def main(input_directory, output_directory, max_workers, force_regenerate):
+def main(input_directory, output_directory, max_workers, force_regenerate,
+         h_min, h_max, lon_min, lon_max, lat_min, lat_max):
     """主函数，执行整个预处理流程。"""
     if not os.path.exists(output_directory):
         os.makedirs(output_directory)
@@ -405,7 +404,9 @@ def main(input_directory, output_directory, max_workers, force_regenerate):
         print(f"--- 阶段一: 完成。初始解析后共加载 {len(initial_df)} 条记录。 ---")
 
     # 在轨迹切分前进行地理和高度过滤
-    filtered_df = filter_by_geographic_and_altitude_range(initial_df)
+    filtered_df = filter_by_geographic_and_altitude_range(
+        initial_df, h_min, h_max, lon_min, lon_max, lat_min, lat_max
+    )
     if filtered_df.empty:
         print("--- 地理范围过滤后，没有可处理的数据。 ---")
         return
@@ -447,6 +448,14 @@ if __name__ == '__main__':
     parser.add_argument('--max_workers', type=int, default=16, help='用于并行处理的最大工作进程数')
     parser.add_argument('--force_regenerate', action='store_true', help='如果设置此项，则强制重新生成_01_initial_parsed_data.csv文件，即使它已存在')
     
+    # --- 新增：地理和高度过滤参数 ---
+    parser.add_argument('--h_min', type=float, default=0, help='最低高度 (米)')
+    parser.add_argument('--h_max', type=float, default=20000, help='最高高度 (米)')
+    parser.add_argument('--lon_min', type=float, default=110, help='最小经度')
+    parser.add_argument('--lon_max', type=float, default=120, help='最大经度')
+    parser.add_argument('--lat_min', type=float, default=33, help='最小纬度')
+    parser.add_argument('--lat_max', type=float, default=42, help='最大纬度')
+
     args = parser.parse_args()
 
     pd.set_option('future.no_silent_downcasting', True)
@@ -460,5 +469,11 @@ if __name__ == '__main__':
             input_directory=args.input_dir,
             output_directory=args.output_dir,
             max_workers=args.max_workers,
-            force_regenerate=args.force_regenerate
+            force_regenerate=args.force_regenerate,
+            h_min=args.h_min,
+            h_max=args.h_max,
+            lon_min=args.lon_min,
+            lon_max=args.lon_max,
+            lat_min=args.lat_min,
+            lat_max=args.lat_max
         )
