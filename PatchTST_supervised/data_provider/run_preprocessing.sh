@@ -32,6 +32,18 @@ LON_MAX=180
 LAT_MIN=-90
 LAT_MAX=90
 
+H_MIN=0
+H_MAX=20000
+LON_MIN=110
+LON_MAX=120
+LAT_MIN=33
+LAT_MAX=42
+
+# # 定义范围
+# H_MIN, H_MAX = 0, 20000
+# LON_MIN, LON_MAX = 110, 120
+# LAT_MIN, LAT_MAX = 33, 42
+
 
 # --- 脚本执行逻辑 (一般无需修改) ---
 
