@@ -1,7 +1,7 @@
 import pandas as pd
 from scipy.signal import savgol_filter
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import timedelta
 from sklearn.neighbors import LocalOutlierFactor
 import os
 import glob
@@ -9,7 +9,7 @@ import glob
 import argparse
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
-from os import cpu_count
+# from os import cpu_count  # 未使用，已注释
 
 # ==============================================================================
 # 用于并行处理的辅助函数与工作函数
@@ -82,32 +82,74 @@ def _process_trajectory_group_worker(group_df, ground_altitude_threshold=300):
             
     return all_segments
 
-def _filter_duration_worker(df, min_duration_minutes=15):
-    """工作函数：根据持续时间过滤单个轨迹（已添加异常处理）。"""
+def _filter_by_point_count_worker(df, min_point_count=792):
+    """工作函数：根据数据点数量过滤单个轨迹（已添加异常处理）。
+
+    Args:
+        df: 轨迹数据DataFrame
+        min_point_count: 最小点数阈值，默认792点（对应约13.2分钟的1秒采样数据）
+    """
     try:
-        min_duration = timedelta(minutes=min_duration_minutes)
-        if df is None or len(df) < 2:
+        if df is None or len(df) < min_point_count:
+            if df is not None:
+                unique_id = df['Unique_ID'].iloc[0]
+                print(f"已过滤掉点数不足的轨迹: {unique_id} (点数: {len(df)}, 需要: {min_point_count})")
             return None
-        
-        start_time = pd.to_datetime(df.iloc[0]['Time'])
-        end_time = pd.to_datetime(df.iloc[-1]['Time'])
-        duration = end_time - start_time
-        
-        if duration >= min_duration:
-            return df
-        
-        unique_id = df['Unique_ID'].iloc[0]
-        print(f"已过滤掉过短的轨迹: {unique_id} (持续时间: {duration})")
-        return None
+
+        return df
+
     except Exception as e:
         # 在多进程中，这个打印操作可以帮助我们定位到导致崩溃的具体数据块
         unique_id = df['Unique_ID'].iloc[0] if 'Unique_ID' in df.columns and not df.empty else "Unknown ID"
-        print(f"--- 工作进程错误: 在过滤时长时处理轨迹 {unique_id} 失败。原因: {e} ---")
+        print(f"--- 工作进程错误: 在过滤点数时处理轨迹 {unique_id} 失败。原因: {e} ---")
         return None
+
+def _validate_sampling_rate_worker(df):
+    """工作函数：验证轨迹数据的采样率是否为1秒。
+
+    Args:
+        df: 轨迹数据DataFrame
+
+    Returns:
+        df: 如果采样率正确则返回原数据，否则返回None
+    """
+    try:
+        if df is None or len(df) < 2:
+            return df
+
+        # 将时间列转换为datetime类型
+        df_copy = df.copy()
+        df_copy['Time'] = pd.to_datetime(df_copy['Time'])
+
+        # 计算时间间隔
+        time_diffs = df_copy['Time'].diff().dropna()
+
+        # 检查是否大部分时间间隔都是1秒（允许一些误差）
+        one_second = pd.Timedelta(seconds=1)
+        tolerance = pd.Timedelta(milliseconds=100)  # 100ms的容差
+
+        correct_intervals = ((time_diffs >= one_second - tolerance) &
+                           (time_diffs <= one_second + tolerance)).sum()
+        total_intervals = len(time_diffs)
+
+        # 如果超过95%的间隔都是1秒左右，认为采样率正确
+        if correct_intervals / total_intervals >= 0.95:
+            return df
+        else:
+            unique_id = df['Unique_ID'].iloc[0]
+            print(f"--- 警告: 轨迹 {unique_id} 的采样率不是1秒 (正确间隔比例: {correct_intervals/total_intervals:.2%}) ---")
+            return df  # 仍然返回数据，只是给出警告
+
+    except Exception as e:
+        unique_id = df['Unique_ID'].iloc[0] if 'Unique_ID' in df.columns and not df.empty else "Unknown ID"
+        print(f"--- 工作进程错误: 验证轨迹 {unique_id} 采样率失败。原因: {e} ---")
+        return df  # 出错时仍返回原数据
 
 def _filter_military_worker(df, lon_threshold=2.0, lat_threshold=2.0):
     """工作函数：根据位移过滤单个轨迹（疑似军航）。"""
     if len(df) < 2: return None
+    unique_id = df['Unique_ID'].iloc[0]
+    print(f" Current Flight ID: {unique_id}")
     start_point = df.iloc[0]
     end_point = df.iloc[-1]
     delta_lon = abs(end_point['Lon'] - start_point['Lon'])
@@ -362,10 +404,14 @@ def sort_and_split_trajectory(df, ground_altitude_threshold=300, max_workers=16)
                 
     return all_segments
 
-def filter_short_trajectories(segments, min_duration_minutes=15, max_workers=16):
-    """并行地按持续时间过滤轨迹。"""
-    worker = partial(_filter_duration_worker, min_duration_minutes=min_duration_minutes)
+def filter_short_trajectories_by_points(segments, min_point_count=792, max_workers=16):
+    """并行地按数据点数量过滤轨迹。"""
+    worker = partial(_filter_by_point_count_worker, min_point_count=min_point_count)
     return _parallel_executor(worker, segments, max_workers)
+
+def validate_sampling_rates(segments, max_workers=16):
+    """并行地验证轨迹的采样率。"""
+    return _parallel_executor(_validate_sampling_rate_worker, segments, max_workers)
 
 def filter_military_flights(segments, lon_threshold=2.0, lat_threshold=2.0, max_workers=16):
     """并行地过滤疑似军航的轨迹。"""
@@ -411,19 +457,40 @@ def main(input_directory, output_directory, max_workers, force_regenerate,
         print("--- 地理范围过滤后，没有可处理的数据。 ---")
         return
 
-    print(f"\n--- 阶段二: 开始轨迹切分与过滤 (使用 {max_workers} 个进程) ---")
+    print(f"\n--- 阶段二: 开始轨迹切分与初步过滤 (使用 {max_workers} 个进程) ---")
     trajectory_segments = sort_and_split_trajectory(filtered_df, max_workers=max_workers)
     print(f"--- 轨迹切分完成。共生成 {len(trajectory_segments)} 个潜在的轨迹段。 ---")
 
-    duration_filtered_segments = filter_short_trajectories(trajectory_segments, min_duration_minutes=15, max_workers=max_workers)
-    print(f"--- 按持续时间过滤后 (保留 > 15分钟)，剩余 {len(duration_filtered_segments)} 个航段。 ---")
-    
-    filtered_segments = filter_military_flights(duration_filtered_segments, max_workers=max_workers)
-    print(f"--- 阶段二: 完成。军航过滤后剩余 {len(filtered_segments)} 个航段。 ---")
+    # --- 新增功能: 根据用户请求，在军航过滤前保存轨迹段 ---
+    if trajectory_segments:
+        split_segments_df = pd.concat(trajectory_segments, ignore_index=True)
+        # 确保时间列是字符串格式，以便于CSV存储
+        if 'Time' in split_segments_df.columns and pd.api.types.is_datetime64_any_dtype(split_segments_df['Time']):
+            split_segments_df['Time'] = split_segments_df['Time'].dt.strftime('%Y%m%d %H:%M:%S.%f').str[:-3]
+        
+        output_filename_before_military = os.path.join(output_directory, "_02_after_split_before_military_filter.csv")
+        print(f"\n--- 正在保存在军航过滤前的轨迹段到 {output_filename_before_military} ---")
+        split_segments_df.to_csv(output_filename_before_military, index=False, encoding='utf-8-sig')
+        print(f"--- 保存成功，共 {len(split_segments_df)} 行，{split_segments_df['Unique_ID'].nunique()} 个轨迹段。 ---\n")
+
+    # 先过滤军航，再进行插值平滑
+    filtered_segments = filter_military_flights(trajectory_segments, max_workers=max_workers)
+    print(f"--- 军航过滤后剩余 {len(filtered_segments)} 个航段。 ---")
+    print(f"--- 阶段二: 完成。 ---")
 
     print(f"\n--- 阶段三: 开始插值与平滑处理 (使用 {max_workers} 个进程) ---")
-    final_trajectories = interpolate_and_smooth(filtered_segments, max_workers=max_workers)
-    print(f"--- 阶段三: 完成。共处理了 {len(final_trajectories)} 个航段。 ---")
+    smoothed_trajectories = interpolate_and_smooth(filtered_segments, max_workers=max_workers)
+    print(f"--- 插值与平滑处理完成。共处理了 {len(smoothed_trajectories)} 个航段。 ---")
+
+    # 验证采样率
+    print(f"--- 开始验证采样率 (使用 {max_workers} 个进程) ---")
+    validated_trajectories = validate_sampling_rates(smoothed_trajectories, max_workers=max_workers)
+    print(f"--- 采样率验证完成。 ---")
+
+    # 最后根据点数过滤短轨迹（792点对应约13.2分钟）
+    print(f"--- 开始根据点数过滤短轨迹 (最小792点) (使用 {max_workers} 个进程) ---")
+    final_trajectories = filter_short_trajectories_by_points(validated_trajectories, min_point_count=792, max_workers=max_workers)
+    print(f"--- 阶段三: 完成。点数过滤后剩余 {len(final_trajectories)} 个航段。 ---")
 
     print("\n--- 正在保存已处理的轨迹 ---")
     if final_trajectories:

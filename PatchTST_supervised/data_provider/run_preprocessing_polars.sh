@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# 高性能飞行数据预处理一键运行脚本 (Polars版) - v3 (编码可配置)
+# 高性能飞行数据预处理一键运行脚本 (Polars版) - v4 (真正并行化)
 # ==============================================================================
 
 # --- 说明 ---
@@ -13,15 +13,19 @@
 INPUT_DIR="./PatchTST_supervised/dataset/raw/"
 OUTPUT_DIR="./PatchTST_supervised/dataset/processed_data_polars/"
 
-# 2. 输出格式
+# 2. 并行处理的工作进程数
+#    建议设置为您的CPU核心数。
+MAX_WORKERS=4
+
+# 3. 输出格式
 #    可选项: 'csv' 或 'parquet'。Parquet 格式更高效，推荐使用。
 OUTPUT_FORMAT="parquet"
 
-# 3. 编码检测优先级
+# 4. 编码检测优先级
 #    可选项: 'gbk' 或 'utf8'。脚本会优先尝试此编码，失败后尝试另一种。
 ENCODING_PRIORITY="utf8"
 
-# 4. 地理和高度范围过滤参数
+# 5. 地理和高度范围过滤参数
 H_MIN=0
 H_MAX=20000
 LON_MIN=-180
@@ -40,10 +44,11 @@ fi
 # 打印将要执行的命令，方便调试
 echo ""
 echo "--- 当前工作目录: $(pwd) ---"
-echo "--- 将要执行的命令 (Polars版): ---"
+echo "--- 将要执行的命令 (Polars并行版): ---"
 echo "python PatchTST_supervised/data_provider/flight_data_preprocessor_polars.py \\"
 echo "    --input_dir \"$INPUT_DIR\" \\"
 echo "    --output_dir \"$OUTPUT_DIR\" \\"
+echo "    --max_workers $MAX_WORKERS \\"
 echo "    --output_format \"$OUTPUT_FORMAT\" \\"
 echo "    --encoding_priority \"$ENCODING_PRIORITY\" \\"
 echo "    --h_min $H_MIN --h_max $H_MAX \\"
@@ -56,6 +61,7 @@ echo ""
 python PatchTST_supervised/data_provider/flight_data_preprocessor_polars.py \
     --input_dir "$INPUT_DIR" \
     --output_dir "$OUTPUT_DIR" \
+    --max_workers "$MAX_WORKERS" \
     --output_format "$OUTPUT_FORMAT" \
     --encoding_priority "$ENCODING_PRIORITY" \
     --h_min "$H_MIN" --h_max "$H_MAX" \

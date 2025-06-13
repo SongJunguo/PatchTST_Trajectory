@@ -138,6 +138,8 @@ def filter_military_flights(trajectory_segments, lon_threshold=200.0, lat_thresh
     """
     filtered_segments = []
     for df in trajectory_segments:
+        unique_id = df['Unique_ID'].iloc[0]
+        print(f" Current Flight ID: {unique_id}")
         if len(df) < 2:
             continue
         start_point = df.iloc[0]

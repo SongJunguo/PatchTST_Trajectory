@@ -36,7 +36,10 @@ from tqdm import tqdm
 import psutil
 from datetime import timedelta
 import warnings
-# SklearnUserWarning is just the built-in UserWarning
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+import multiprocessing
+
 
 # 2. Logging Setup
 logging.basicConfig(
@@ -219,10 +222,25 @@ def _smooth_and_clean_udf(group_df: pl.DataFrame) -> pl.DataFrame:
         return empty_df # 返回预定义的空DataFrame
 
 
+# 这是一个新的顶层工作函数，用于并行处理一个航段
+def _process_trajectory_worker(unique_id: str, temp_file_path: str) -> pl.DataFrame:
+    """
+    工作函数，用于处理单个Unique_ID。
+    它从临时文件中只读取自己需要的数据。
+    """
+    # 从临时Parquet文件中过滤出当前进程负责的航段
+    trajectory_df = pl.scan_parquet(temp_file_path).filter(pl.col("Unique_ID") == unique_id).collect()
+    
+    # 对单个航段应用UDF
+    if not trajectory_df.is_empty():
+        return _smooth_and_clean_udf(trajectory_df)
+    return pl.DataFrame()
+
+
 # 5. Main Processing Function
 def process_flight_data(input_dir: str, output_dir: str, output_format: str,
                         h_min: float, h_max: float, lon_min: float, lon_max: float,
-                        lat_min: float, lat_max: float, encoding_priority: str):
+                        lat_min: float, lat_max: float, encoding_priority: str, max_workers: int):
     """
     主处理流程函数，包含了计划书中定义的四个阶段。
     """
@@ -308,15 +326,52 @@ def process_flight_data(input_dir: str, output_dir: str, output_format: str,
         logging.warning("所有数据均在初始过滤阶段（如地理范围、有效日期等）被移除。没有可处理的航段。程序终止。")
         return
 
-    # --- 阶段三: 复杂平滑 (Streaming & Parallel) ---
-    logging.info("--- 阶段三: 触发流式计算并对每个航段进行平滑处理... ---")
+    # --- 阶段三: 真正的并行化平滑处理 ---
+    logging.info("--- 阶段三: 准备进行并行化平滑处理... ---")
     
-    # 使用最佳实践来避免警告
-    output_schema = segmented_lf.collect_schema()
-    final_lazy_df = segmented_lf.group_by("Unique_ID").map_groups(
-        _smooth_and_clean_udf, schema=output_schema
-    )
-    processed_df = final_lazy_df.collect(engine='streaming')
+    temp_file = os.path.join(output_dir, "_temp_segmented_data.parquet")
+    all_processed_dfs = []
+    executor = ProcessPoolExecutor(max_workers=max_workers)
+
+    try:
+        logging.info("正在将分段数据写入临时文件以便并行读取...")
+        segmented_lf.sink_parquet(temp_file)
+        
+        unique_ids = pl.scan_parquet(temp_file).select("Unique_ID").unique().collect()["Unique_ID"].to_list()
+        
+        if not unique_ids:
+            logging.warning("没有唯一的航段ID可供处理。")
+            executor.shutdown()
+            return
+            
+        logging.info(f"准备将 {len(unique_ids)} 个独立航段分发到 {max_workers} 个进程中进行处理。")
+
+        worker_func = partial(_process_trajectory_worker, temp_file_path=temp_file)
+        
+        with tqdm(total=len(unique_ids), desc="并行处理航段") as pbar:
+            for result_df in executor.map(worker_func, unique_ids):
+                if not result_df.is_empty():
+                    all_processed_dfs.append(result_df)
+                pbar.update(1)
+        
+        executor.shutdown(wait=True) # Clean shutdown on success
+
+    except KeyboardInterrupt:
+        logging.warning("\n--- 用户中断了处理流程。正在强制关闭工作进程... ---")
+        # On interrupt, shutdown without waiting and cancel futures (Python 3.9+).
+        executor.shutdown(wait=False, cancel_futures=True)
+        return # Exit the function
+    finally:
+        # This block ensures the temp file is always removed.
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+            logging.info(f"已清理临时文件: {temp_file}")
+
+    if not all_processed_dfs:
+        logging.warning("所有航段处理后均为空，没有可保存的数据。")
+        return
+        
+    processed_df = pl.concat(all_processed_dfs)
 
     # --- 阶段四: 保存结果 ---
     logging.info("--- 阶段四: 正在保存最终结果... ---")
@@ -352,9 +407,10 @@ def process_flight_data(input_dir: str, output_dir: str, output_format: str,
 
 # 6. Main Execution Block
 if __name__ == '__main__':
-    # 为了在Windows上也能正常使用多进程
-    # pl.Config.set_tbl_rows(10) # for debugging
-    
+    # 根据Polars官方文档，为防止多进程死锁，推荐在Unix系统上使用 'spawn' 方法
+    if multiprocessing.get_start_method(allow_none=True) != 'spawn':
+        multiprocessing.set_start_method("spawn", force=True)
+
     parser = argparse.ArgumentParser(
         description="高性能飞行数据预处理器 (Polars版)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -364,6 +420,7 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, required=True, help='用于存放处理后数据的输出目录路径')
     parser.add_argument('--output_format', type=str, default='csv', choices=['csv', 'parquet'], help='输出文件的格式')
     parser.add_argument('--encoding_priority', type=str, default='gbk', choices=['gbk', 'utf8'], help='优先尝试的文件编码')
+    parser.add_argument('--max_workers', type=int, default=os.cpu_count(), help='用于并行处理的最大工作进程数')
     
     # 地理和高度过滤参数
     parser.add_argument('--h_min', type=float, default=0, help='最低高度 (米)')
@@ -391,5 +448,6 @@ if __name__ == '__main__':
         lon_max=args.lon_max,
         lat_min=args.lat_min,
         lat_max=args.lat_max,
-        encoding_priority=args.encoding_priority
+        encoding_priority=args.encoding_priority,
+        max_workers=args.max_workers
     )
