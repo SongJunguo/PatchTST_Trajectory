@@ -279,7 +279,7 @@ def load_and_process_files(directory_path, output_directory):
 def filter_by_geographic_and_altitude_range(df):
     """
     新增阶段：根据地理和高度范围过滤轨迹。
-    在轨迹切分前，如果一个ID的任何数据点超出了范围，则删除该ID的所有数据。
+    只删除超出范围的数据行，而不是整个ID。
     """
     print("\n--- 新增阶段: 开始基于地理和高度范围的过滤 ---")
     
@@ -288,31 +288,24 @@ def filter_by_geographic_and_altitude_range(df):
     LON_MIN, LON_MAX = 110, 120
     LAT_MIN, LAT_MAX = 33, 42
     
-    # 找出超出范围的行
-    out_of_range_df = df[
-        (df['H'] < H_MIN) | (df['H'] > H_MAX) |
-        (df['Lon'] < LON_MIN) | (df['Lon'] > LON_MAX) |
-        (df['Lat'] < LAT_MIN) | (df['Lat'] > LAT_MAX)
-    ]
+    initial_rows = len(df)
+
+    # 保留在范围内的行
+    filtered_df = df[
+        (df['H'] >= H_MIN) & (df['H'] <= H_MAX) &
+        (df['Lon'] >= LON_MIN) & (df['Lon'] <= LON_MAX) &
+        (df['Lat'] >= LAT_MIN) & (df['Lat'] <= LAT_MAX)
+    ].copy()
     
-    if out_of_range_df.empty:
-        print("--- 所有轨迹均在指定的地理和高度范围内。无需删除。 ---")
-        return df
-        
-    # 获取需要删除的ID列表
-    ids_to_remove = out_of_range_df['ID'].unique()
+    final_rows = len(filtered_df)
+    rows_removed = initial_rows - final_rows
     
-    initial_id_count = df['ID'].nunique()
-    num_ids_to_remove = len(ids_to_remove)
-    
-    print(f"--- 发现 {num_ids_to_remove} 个ID的轨迹超出了范围，将被移除。 ---")
-    
-    # 从原始DataFrame中过滤掉这些ID
-    filtered_df = df[~df['ID'].isin(ids_to_remove)]
-    
-    final_id_count = filtered_df['ID'].nunique()
-    
-    print(f"--- 新增阶段: 完成。过滤前共有 {initial_id_count} 个ID，过滤后剩余 {final_id_count} 个ID。 ---")
+    if rows_removed > 0:
+        print(f"--- 移除了 {rows_removed} 行超出地理或高度范围的数据。 ---")
+    else:
+        print("--- 所有数据点均在指定的地理和高度范围内。无需删除。 ---")
+
+    print(f"--- 新增阶段: 完成。过滤前共有 {initial_rows} 行，过滤后剩余 {final_rows} 行。 ---")
     
     return filtered_df
 
