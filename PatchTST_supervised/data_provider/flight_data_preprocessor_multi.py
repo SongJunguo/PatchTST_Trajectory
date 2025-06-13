@@ -276,6 +276,46 @@ def load_and_process_files(directory_path, output_directory):
     df['Time'] = df['Time'].dt.strftime('%Y%m%d %H:%M:%S.%f').str[:-3]
     return df
 
+def filter_by_geographic_and_altitude_range(df):
+    """
+    新增阶段：根据地理和高度范围过滤轨迹。
+    在轨迹切分前，如果一个ID的任何数据点超出了范围，则删除该ID的所有数据。
+    """
+    print("\n--- 新增阶段: 开始基于地理和高度范围的过滤 ---")
+    
+    # 定义范围
+    H_MIN, H_MAX = 0, 10000
+    LON_MIN, LON_MAX = 110, 120
+    LAT_MIN, LAT_MAX = 33, 42
+    
+    # 找出超出范围的行
+    out_of_range_df = df[
+        (df['H'] < H_MIN) | (df['H'] > H_MAX) |
+        (df['Lon'] < LON_MIN) | (df['Lon'] > LON_MAX) |
+        (df['Lat'] < LAT_MIN) | (df['Lat'] > LAT_MAX)
+    ]
+    
+    if out_of_range_df.empty:
+        print("--- 所有轨迹均在指定的地理和高度范围内。无需删除。 ---")
+        return df
+        
+    # 获取需要删除的ID列表
+    ids_to_remove = out_of_range_df['ID'].unique()
+    
+    initial_id_count = df['ID'].nunique()
+    num_ids_to_remove = len(ids_to_remove)
+    
+    print(f"--- 发现 {num_ids_to_remove} 个ID的轨迹超出了范围，将被移除。 ---")
+    
+    # 从原始DataFrame中过滤掉这些ID
+    filtered_df = df[~df['ID'].isin(ids_to_remove)]
+    
+    final_id_count = filtered_df['ID'].nunique()
+    
+    print(f"--- 新增阶段: 完成。过滤前共有 {initial_id_count} 个ID，过滤后剩余 {final_id_count} 个ID。 ---")
+    
+    return filtered_df
+
 def _parallel_executor(worker_func, items_to_process, max_workers):
     """通用辅助函数，用于并行运行任何工作函数。"""
     results_list = []
@@ -338,8 +378,14 @@ def main(input_directory, output_directory, max_workers):
         return
     print(f"--- 阶段一: 完成。初始解析后共加载 {len(initial_df)} 条记录。 ---")
 
+    # 在轨迹切分前进行地理和高度过滤
+    filtered_df = filter_by_geographic_and_altitude_range(initial_df)
+    if filtered_df.empty:
+        print("--- 地理范围过滤后，没有可处理的数据。 ---")
+        return
+
     print(f"\n--- 阶段二: 开始轨迹切分与过滤 (使用 {max_workers} 个进程) ---")
-    trajectory_segments = sort_and_split_trajectory(initial_df, max_workers=max_workers)
+    trajectory_segments = sort_and_split_trajectory(filtered_df, max_workers=max_workers)
     print(f"--- 轨迹切分完成。共生成 {len(trajectory_segments)} 个潜在的轨迹段。 ---")
 
     duration_filtered_segments = filter_short_trajectories(trajectory_segments, min_duration_minutes=15, max_workers=max_workers)
@@ -363,7 +409,7 @@ def main(input_directory, output_directory, max_workers):
         full_processed_df['Time'] = pd.to_datetime(full_processed_df['Time']).dt.strftime('%Y%m%d %H:%M:%S.%f').str[:-3]
         output_filename = os.path.join(output_directory, "processed_trajectories_multi.csv")
         full_processed_df.to_csv(output_filename, index=False, encoding='utf-8-sig')
-        print(f"--- 所有阶段完成。已保存 {len(final_trajectories)} 条处理后的轨迹到 {output_filename} ---")
+        print(f"--- 所有阶段完成。已保存 {full_processed_df['ID'].nunique()} 条处理后的轨迹到 {output_filename} ---")
     else:
         print("--- 所有阶段完成。没有可保存的轨迹。 ---")
 
