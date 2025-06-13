@@ -19,13 +19,25 @@ MAX_WORKERS=4
 
 # 3. 输出格式
 #    可选项: 'csv' 或 'parquet'。Parquet 格式更高效，推荐使用。
-OUTPUT_FORMAT="parquet"
+OUTPUT_FORMAT="csv"
 
 # 4. 编码检测优先级
 #    可选项: 'gbk' 或 'utf8'。脚本会优先尝试此编码，失败后尝试另一种。
 ENCODING_PRIORITY="utf8"
 
-# 5. 地理和高度范围过滤参数
+# 5. 轨迹切分时间间隔 (分钟)
+#    如果两个连续点的时间差超过此值，则切分为新航段。
+SEGMENT_SPLIT_MINUTES=5
+
+# 6. 日志级别
+#    可选项: 'DEBUG', 'INFO', 'WARNING', 'ERROR'
+LOG_LEVEL="INFO"
+
+# 7. 清洗航段的最小长度
+#    航段的数据点数量必须大于此值，才会被处理。
+MIN_LEN_FOR_CLEAN=792
+
+# 8. 地理和高度范围过滤参数
 H_MIN=0
 H_MAX=20000
 LON_MIN=-180
@@ -53,7 +65,10 @@ echo "    --output_format \"$OUTPUT_FORMAT\" \\"
 echo "    --encoding_priority \"$ENCODING_PRIORITY\" \\"
 echo "    --h_min $H_MIN --h_max $H_MAX \\"
 echo "    --lon_min $LON_MIN --lon_max $LON_MAX \\"
-echo "    --lat_min $LAT_MIN --lat_max $LAT_MAX"
+echo "    --lat_min $LAT_MIN --lat_max $LAT_MAX \\"
+echo "    --segment_split_minutes $SEGMENT_SPLIT_MINUTES \\"
+echo "    --log_level \"$LOG_LEVEL\" \\"
+echo "    --min_len_for_clean $MIN_LEN_FOR_CLEAN"
 echo "------------------------------------"
 echo ""
 
@@ -66,7 +81,10 @@ python PatchTST_supervised/data_provider/flight_data_preprocessor_polars.py \
     --encoding_priority "$ENCODING_PRIORITY" \
     --h_min "$H_MIN" --h_max "$H_MAX" \
     --lon_min "$LON_MIN" --lon_max "$LON_MAX" \
-    --lat_min "$LAT_MIN" --lat_max "$LAT_MAX"
+    --lat_min "$LAT_MIN" --lat_max "$LAT_MAX" \
+    --segment_split_minutes "$SEGMENT_SPLIT_MINUTES" \
+    --log_level "$LOG_LEVEL" \
+    --min_len_for_clean "$MIN_LEN_FOR_CLEAN"
 
 echo ""
 echo "--- Polars 脚本执行完毕。 ---"

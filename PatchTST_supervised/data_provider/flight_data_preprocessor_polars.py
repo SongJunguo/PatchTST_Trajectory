@@ -39,14 +39,28 @@ import warnings
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 import multiprocessing
+from typing import Optional
 
 
 # 2. Logging Setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - [%(levelname)s] - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+def setup_logging(log_dir: str, log_level: str):
+    """配置日志，使其同时输出到控制台和文件。"""
+    log_filename = os.path.join(log_dir, "polars_preprocessing.log")
+    
+    # 确保日志目录存在
+    os.makedirs(log_dir, exist_ok=True)
+    
+    level = getattr(logging, log_level.upper(), logging.INFO)
+
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - [%(levelname)s] - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[
+            logging.FileHandler(log_filename, mode='w'), # 写入文件，每次覆盖
+            logging.StreamHandler()                     # 输出到控制台
+        ]
+    )
 
 # 3. Constants
 # 定义输入文件的Schema，强制数据类型可以提升读取速度并减少内存占用
@@ -135,95 +149,88 @@ def dms_to_decimal_expr(dms_col: str) -> pl.Expr:
     return degrees + minutes / 60 + seconds / 3600
 
 
-def _smooth_and_clean_udf(group_df: pl.DataFrame) -> pl.DataFrame:
+def _smooth_and_clean_udf(group_df: pl.DataFrame, min_len_for_clean: int) -> Optional[pl.DataFrame]:
     """
-    健壮的用户定义函数 (UDF)，用于对单个航段进行平滑和清理。
-    包裹在 try-except 块中，以确保单个航段的处理失败不会影响整个任务。
+    健壮且逻辑优化的用户定义函数 (UDF)，用于对单个航段进行平滑和清理。
+    遵循“先清洗、后插值、再平滑”的原则。
     """
-    # 预先定义UDF的输出schema，确保任何分支都返回一致的结构
     output_schema = {
-        "Unique_ID": pl.Utf8,
-        "Time": pl.Datetime,
-        "Lon": pl.Float64,
-        "Lat": pl.Float64,
-        "H": pl.Float64,
+        "Unique_ID": pl.Utf8, "Time": pl.Datetime, "Lon": pl.Float64,
+        "Lat": pl.Float64, "H": pl.Float64,
     }
     empty_df = pl.DataFrame(schema=output_schema)
-    
     unique_id = group_df["Unique_ID"][0]
+    features = ['Lat', 'Lon', 'H']
+
     try:
-        # 0. 预处理：只选择我们需要的列，确保 schema 一致性
-        proc_df = group_df.select("Unique_ID", "Time", "Lon", "Lat", "H").sort("Time").unique(subset=["Time"], keep="first")
+        # 步骤 0: 预处理 - 排序并确保时间戳唯一
+        proc_df = group_df.select("Unique_ID", "Time", *features).sort("Time").unique(subset=["Time"], keep="first")
 
-        if len(proc_df) < 2:
-            logging.warning(f"航段 {unique_id} 的数据点不足 (<2)，跳过处理。")
-            return empty_df
+        if len(proc_df) < min_len_for_clean: # 增加阈值以进行更可靠的异常检测
+            # 对于过短的航段，直接返回None，由主进程统一计数和报告
+            return None
 
-        # 1. 重采样到1秒间隔
-        resampled_df = proc_df.upsample(time_column='Time', every='1s')
+        # 步骤 1: 在原始数据上进行离群点检测 (LOF)
+        X = proc_df.select(features).to_numpy()
+        # n_neighbors不能超过样本数
+        n_neighbors = min(min_len_for_clean, len(X) - 1)
+        if n_neighbors > 0:
+            lof = LocalOutlierFactor(n_neighbors=n_neighbors)
+            lof_outlier_mask = lof.fit_predict(X) == -1 # True表示异常
+        else:
+            lof_outlier_mask = np.zeros(len(X), dtype=bool) # 点太少，不认为有异常
 
-        # 2. 线性插值填充采样引入的空值
-        features = ['Lat', 'Lon', 'H']
-        resampled_df = resampled_df.with_columns(
-            pl.col(features).interpolate(method='linear')
-        )
+        # 步骤 2: 在原始数据上进行高度异常检测
+        heights = proc_df['H'].to_numpy()
+        times = proc_df['Time'].to_numpy()
+        height_anomaly_results = detect_height_anomalies(heights, times)
+        # mask中True表示正常，False表示异常
+        height_anomaly_mask = height_anomaly_results['mask']
+
+        # 步骤 3: 合并异常标记，并将所有异常点设为None
+        # 一个点是“好”的，当且仅当它不是LOF离群点 AND 不是高度异常点
+        is_good_point_mask = ~lof_outlier_mask & height_anomaly_mask
         
-        # 3. 离群点检测 (LOF)
-        X = resampled_df.select(features).to_numpy()
-        lof = LocalOutlierFactor(n_neighbors=min(50, len(X)), contamination=0.05)
-        outlier_mask = lof.fit_predict(X) == -1
-        
-        resampled_df = resampled_df.with_columns(
-            pl.when(pl.lit(pl.Series(outlier_mask)))
-              .then(None)
-              .otherwise(pl.col(c))
-              .alias(c)
-            for c in features
-        ).with_columns(
-            pl.col(features).interpolate(method='linear')
-        )
-
-        # 4. 高度异常检测
-        heights = resampled_df['H'].to_numpy()
-        times = resampled_df['Time'].to_numpy()
-        anomaly_results = detect_height_anomalies(heights, times)
-        
-        resampled_df = resampled_df.with_columns(
-            pl.when(pl.lit(pl.Series(anomaly_results['mask'])))
+        cleaned_df = proc_df.with_columns(
+            pl.when(pl.lit(pl.Series(is_good_point_mask)))
               .then(pl.col(c))
               .otherwise(None)
               .alias(c)
             for c in features
         )
 
-        # 5. 再次插值并填充边缘NaN
+        # 步骤 4: 重采样到1秒间隔
+        resampled_df = cleaned_df.upsample(time_column='Time', every='1s')
+
+        # 步骤 5: 对所有空值（来自异常点和重采样）进行一次性插值
         resampled_df = resampled_df.with_columns(
             pl.col(features).interpolate(method='linear').backward_fill().forward_fill()
         )
 
-        # 6. Savitzky-Golay 平滑滤波
+        # 步骤 6: Savitzky-Golay 平滑滤波
         if len(resampled_df) <= 51:
             logging.warning(f"航段 {unique_id} 插值后数据点不足 (<=51)，无法进行平滑处理。")
-            return empty_df
+            # 即使不能平滑，也返回插值后的规整数据
+            return resampled_df.select(list(output_schema.keys()))
             
         window_length, polyorder = 51, 2
         
         final_df = resampled_df.with_columns([
-            pl.col('Lat').map_batches(lambda s: pl.Series(values=savgol_filter(s.to_numpy(), window_length, polyorder), dtype=s.dtype)),
-            pl.col('Lon').map_batches(lambda s: pl.Series(values=savgol_filter(s.to_numpy(), window_length, polyorder), dtype=s.dtype)),
-            pl.col('H').map_batches(lambda s: pl.Series(values=savgol_filter(s.to_numpy(), window_length, polyorder), dtype=s.dtype)),
+            pl.col(c).map_batches(lambda s: pl.Series(values=savgol_filter(s.to_numpy(), window_length, polyorder), dtype=s.dtype))
+            for c in features
         ])
         
         # 确保最终输出的列顺序和类型与定义的schema一致
+        logging.debug(f"航段 {unique_id} 成功处理完成。")
         return final_df.select(list(output_schema.keys()))
 
     except Exception as e:
         logging.error(f"处理航段 {unique_id} 时发生严重错误: {e}", exc_info=True)
-        return empty_df # 返回预定义的空DataFrame
+        return empty_df
 
 
 # 这是一个新的顶层工作函数，用于并行处理一个航段
-def _process_trajectory_worker(unique_id: str, temp_file_path: str) -> pl.DataFrame:
+def _process_trajectory_worker(unique_id: str, temp_file_path: str, min_len_for_clean: int) -> Optional[pl.DataFrame]:
     """
     工作函数，用于处理单个Unique_ID。
     它从临时文件中只读取自己需要的数据。
@@ -233,17 +240,21 @@ def _process_trajectory_worker(unique_id: str, temp_file_path: str) -> pl.DataFr
     
     # 对单个航段应用UDF
     if not trajectory_df.is_empty():
-        return _smooth_and_clean_udf(trajectory_df)
+        return _smooth_and_clean_udf(trajectory_df, min_len_for_clean=min_len_for_clean)
     return pl.DataFrame()
 
 
 # 5. Main Processing Function
 def process_flight_data(input_dir: str, output_dir: str, output_format: str,
                         h_min: float, h_max: float, lon_min: float, lon_max: float,
-                        lat_min: float, lat_max: float, encoding_priority: str, max_workers: int):
+                        lat_min: float, lat_max: float, encoding_priority: str, max_workers: int,
+                        segment_split_minutes: int, log_level: str, min_len_for_clean: int):
     """
     主处理流程函数，包含了计划书中定义的四个阶段。
     """
+    # 配置日志记录
+    setup_logging(output_dir, log_level)
+
     # 抑制来自sklearn的关于重复值的警告，这在重采样后是正常现象
     warnings.filterwarnings("ignore", category=UserWarning)
     
@@ -312,7 +323,7 @@ def process_flight_data(input_dir: str, output_dir: str, output_format: str,
     # 轨迹切分表达式
     segmented_lf = transformed_lf.sort("ID", "Time").with_columns(
         (
-            pl.col("Time").diff().over("ID") > timedelta(minutes=15)
+            pl.col("Time").diff().over("ID") > timedelta(minutes=segment_split_minutes)
         ).fill_null(False).alias("new_segment_marker")
     ).with_columns(
         pl.col("new_segment_marker").cum_sum().over("ID").alias("segment_id")  # type: ignore
@@ -346,15 +357,22 @@ def process_flight_data(input_dir: str, output_dir: str, output_format: str,
             
         logging.info(f"准备将 {len(unique_ids)} 个独立航段分发到 {max_workers} 个进程中进行处理。")
 
-        worker_func = partial(_process_trajectory_worker, temp_file_path=temp_file)
+        worker_func = partial(_process_trajectory_worker, temp_file_path=temp_file, min_len_for_clean=min_len_for_clean)
         
+        skipped_short_count = 0
         with tqdm(total=len(unique_ids), desc="并行处理航段") as pbar:
             for result_df in executor.map(worker_func, unique_ids):
-                if not result_df.is_empty():
+                if result_df is None:
+                    skipped_short_count += 1
+                elif not result_df.is_empty():
                     all_processed_dfs.append(result_df)
+                # is_empty() 且 not None 的情况意味着UDF内部发生错误并返回了empty_df
                 pbar.update(1)
         
         executor.shutdown(wait=True) # Clean shutdown on success
+
+        if skipped_short_count > 0:
+            logging.info(f"共跳过 {skipped_short_count} 条因数据点过少(<{min_len_for_clean})的航段。")
 
     except KeyboardInterrupt:
         logging.warning("\n--- 用户中断了处理流程。正在强制关闭工作进程... ---")
@@ -421,6 +439,9 @@ if __name__ == '__main__':
     parser.add_argument('--output_format', type=str, default='csv', choices=['csv', 'parquet'], help='输出文件的格式')
     parser.add_argument('--encoding_priority', type=str, default='gbk', choices=['gbk', 'utf8'], help='优先尝试的文件编码')
     parser.add_argument('--max_workers', type=int, default=os.cpu_count(), help='用于并行处理的最大工作进程数')
+    parser.add_argument('--segment_split_minutes', type=int, default=5, help='用于切分轨迹的时间间隔（分钟）')
+    parser.add_argument('--log_level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='设置日志记录级别')
+    parser.add_argument('--min_len_for_clean', type=int, default=792, help='航段进行清洗（异常检测等）所需的最小数据点数')
     
     # 地理和高度过滤参数
     parser.add_argument('--h_min', type=float, default=0, help='最低高度 (米)')
@@ -449,5 +470,8 @@ if __name__ == '__main__':
         lat_min=args.lat_min,
         lat_max=args.lat_max,
         encoding_priority=args.encoding_priority,
-        max_workers=args.max_workers
+        max_workers=args.max_workers,
+        segment_split_minutes=args.segment_split_minutes,
+        log_level=args.log_level,
+        min_len_for_clean=args.min_len_for_clean
     )

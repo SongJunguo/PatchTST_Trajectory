@@ -4,6 +4,12 @@ PatchTST_supervised/data_provider/run_preprocessing.sh
 PatchTST_supervised/data_provider/flight_data_preprocessor_multi.py
 
 使用conda 虚拟环境 conda activate dl_data_env
+
+PatchTST_supervised/data_provider/run_preprocessing_polars.sh
+PatchTST_supervised/data_provider/flight_data_preprocessor_polars.py
+
+详细的梳理这两个用于飞行轨迹数据集处理的脚本的内容，和详细的处理步骤和流程
+
 # **最终执行手册：高性能飞行数据预处理器**
 
 **版本：4.0 (交接最终版)**
