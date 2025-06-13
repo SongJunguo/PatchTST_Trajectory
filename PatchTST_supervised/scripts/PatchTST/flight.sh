@@ -33,7 +33,7 @@ echo "日志将保存到: logs/LongForecasting/${model_name}_${data_name}_${seq_
 echo ""
 
 python -u run_longExp.py \
-  --is_training 1 \
+  --is_training 0 \
   --root_path ./dataset/ \
   --data_path processed_trajectories_multi.csv \
   --model_id 20250612flight_dependent_test \

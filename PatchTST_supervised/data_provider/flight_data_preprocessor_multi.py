@@ -55,8 +55,9 @@ def _process_trajectory_group_worker(group_df, ground_altitude_threshold=300):
     for i in range(1, len(df_sorted)):
         time_diff = pd.to_datetime(df_sorted.loc[i, 'Time']) - pd.to_datetime(df_sorted.loc[i-1, 'Time'])
         if time_diff > timedelta(minutes=10):
-            if df_sorted.loc[i-1, 'H'] < ground_altitude_threshold and df_sorted.loc[i, 'H'] < ground_altitude_threshold:
-                split_indices.append(i)
+            # if df_sorted.loc[i-1, 'H'] < ground_altitude_threshold and df_sorted.loc[i, 'H'] < ground_altitude_threshold:
+            #     split_indices.append(i)
+            split_indices.append(i)
 
     if split_indices:
         original_id = df_sorted['ID'].iloc[0]
@@ -240,7 +241,7 @@ def load_and_process_files(directory_path, output_directory):
     df_list = []
     for file in all_files:
         try:
-            df = pd.read_csv(file, encoding='utf-8', low_memory=False)
+            df = pd.read_csv(file, encoding='gbk', low_memory=False)
             df_list.append(df)
         except UnicodeDecodeError:
             try:
@@ -266,10 +267,10 @@ def load_and_process_files(directory_path, output_directory):
         print(f"移除了 {initial_rows - rows_after_zero_filter} 行在'JD', 'WD', 或 'H'列中为0的数据。")
     else:
         print(f"警告: 列 {required_cols} 中的一个或多个未找到。跳过零值过滤。")
-    full_df['Time'] = pd.to_datetime(full_df['DTRO'], format='%d-%b-%y %I.%M.%S.%f000 %p', errors='coerce')
+    full_df['Time'] = pd.to_datetime(full_df['DTRQ'], format='%d-%b-%y %I.%M.%S.%f000 %p', errors='coerce')
     full_df['Lon'] = full_df['JD'].apply(dms_to_decimal)
     full_df['Lat'] = full_df['WD'].apply(dms_to_decimal)
-    full_df.rename(columns={'PI': 'ID', 'H': 'H'}, inplace=True)
+    full_df.rename(columns={'P1': 'ID', 'H': 'H'}, inplace=True)
     full_df.dropna(subset=['ID', 'H', 'Lon', 'Lat', 'Time'], inplace=True)
     df = full_df[['ID', 'H', 'Lon', 'Lat', 'Time']].copy()
     df['Time'] = df['Time'].dt.strftime('%Y%m%d %H:%M:%S.%f').str[:-3]
