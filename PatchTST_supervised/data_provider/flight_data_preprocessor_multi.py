@@ -6,6 +6,7 @@ from sklearn.neighbors import LocalOutlierFactor
 import os
 import glob
 # --- 新增的库 ---
+import argparse
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 from os import cpu_count
@@ -377,18 +378,31 @@ def interpolate_and_smooth(trajectory_segments, max_workers=16):
     """第三阶段：数据插值与平滑 (并行版)"""
     return _parallel_executor(_interpolate_and_smooth_worker, trajectory_segments, max_workers)
 
-def main(input_directory, output_directory, max_workers):
+def main(input_directory, output_directory, max_workers, force_regenerate):
     """主函数，执行整个预处理流程。"""
     if not os.path.exists(output_directory):
         os.makedirs(output_directory)
         print(f"已创建输出目录: {output_directory}")
 
-    print("--- 阶段一: 开始数据聚合与初始解析 ---")
-    initial_df = load_and_process_files(input_directory, output_directory)
-    if initial_df.empty:
-        print("--- 阶段一: 失败。没有可处理的数据。 ---")
-        return
-    print(f"--- 阶段一: 完成。初始解析后共加载 {len(initial_df)} 条记录。 ---")
+    intermediate_filepath = os.path.join(output_directory, "_01_initial_parsed_data.csv")
+
+    # 根据参数和文件存在情况决定如何加载第一阶段数据
+    if not force_regenerate and os.path.exists(intermediate_filepath):
+        print(f"--- 检测到已存在的初始解析文件，将直接读取: {intermediate_filepath} ---")
+        initial_df = pd.read_csv(intermediate_filepath, low_memory=False)
+        print(f"--- 从缓存文件加载了 {len(initial_df)} 条记录。 ---")
+    else:
+        if force_regenerate:
+            print("--- 用户指定了 --force-regenerate，将强制重新生成初始数据。 ---")
+        else:
+            print(f"--- 未找到初始解析文件，将从原始数据开始处理。 ---")
+        
+        print("\n--- 阶段一: 开始数据聚合与初始解析 ---")
+        initial_df = load_and_process_files(input_directory, output_directory)
+        if initial_df.empty:
+            print("--- 阶段一: 失败。没有可处理的数据。 ---")
+            return
+        print(f"--- 阶段一: 完成。初始解析后共加载 {len(initial_df)} 条记录。 ---")
 
     # 在轨迹切分前进行地理和高度过滤
     filtered_df = filter_by_geographic_and_altitude_range(initial_df)
@@ -426,17 +440,25 @@ def main(input_directory, output_directory, max_workers):
         print("--- 所有阶段完成。没有可保存的轨迹。 ---")
 
 if __name__ == '__main__':
-    # --- 配置路径 ---
-    INPUT_DIR = './dataset/raw/'
-    OUTPUT_DIR = './dataset/processed_data/'
-    pd.set_option('future.no_silent_downcasting', True)
-    # --- 配置并行处理 ---
-    # 根据您的要求，固定使用16个工作进程。
-    MAX_WORKERS = 16
+    # --- 配置路径与参数解析 ---
+    parser = argparse.ArgumentParser(description="飞行数据预处理脚本")
+    parser.add_argument('--input_dir', type=str, default='./dataset/raw/', help='包含原始CSV文件的输入目录路径')
+    parser.add_argument('--output_dir', type=str, default='./dataset/processed_data/', help='用于存放处理后数据的输出目录路径')
+    parser.add_argument('--max_workers', type=int, default=16, help='用于并行处理的最大工作进程数')
+    parser.add_argument('--force_regenerate', action='store_true', help='如果设置此项，则强制重新生成_01_initial_parsed_data.csv文件，即使它已存在')
+    
+    args = parser.parse_args()
 
-    if INPUT_DIR == 'path/to/your/raw_csv_directory' or OUTPUT_DIR == 'path/to/your/processed_data/':
+    pd.set_option('future.no_silent_downcasting', True)
+
+    if args.input_dir == 'path/to/your/raw_csv_directory' or args.output_dir == 'path/to/your/processed_data/':
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        print("!!! 请先修改脚本中的 INPUT_DIR 和 OUTPUT_DIR 变量 !!!")
+        print("!!! 请检查 --input_dir 和 --output_dir 参数是否已正确设置 !!!")
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     else:
-        main(input_directory=INPUT_DIR, output_directory=OUTPUT_DIR, max_workers=MAX_WORKERS)
+        main(
+            input_directory=args.input_dir,
+            output_directory=args.output_dir,
+            max_workers=args.max_workers,
+            force_regenerate=args.force_regenerate
+        )
