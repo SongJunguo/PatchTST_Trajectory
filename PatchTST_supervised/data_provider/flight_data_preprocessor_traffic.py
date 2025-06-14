@@ -2,7 +2,7 @@
 # ==============================================================================
 # ** 高性能飞行数据预处理器 (Polars/Traffic版) **
 #
-# ** 版本: 2.1 (Final) **
+# ** 版本: 2.2 (Final) **
 #
 # ** 依赖项: **
 #   pip install polars numpy tqdm psutil traffic pandas
@@ -484,6 +484,10 @@ def process_flight_data(
         preprocessed_df = pl.concat(all_preprocessed_dfs)
         preprocessed_df = preprocessed_df.rename({"Unique_ID": "ID"}).select(
             ["ID", "Time", "Lon", "Lat", "H"]
+        )
+        # 修复：对中间文件也进行时间格式化
+        preprocessed_df = preprocessed_df.with_columns(
+            pl.col("Time").dt.strftime("%Y%m%d %H:%M:%S%.3f").alias("Time")
         )
         preprocessed_output_path = os.path.join(
             output_dir, f"preprocessed_for_comparison.{output_format}"
