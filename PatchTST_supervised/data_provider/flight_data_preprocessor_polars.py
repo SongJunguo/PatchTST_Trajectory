@@ -202,8 +202,11 @@ def _smooth_and_clean_udf(group_df: pl.DataFrame, min_len_for_clean: int) -> Opt
         # 步骤 4: 重采样到1秒间隔
         resampled_df = cleaned_df.upsample(time_column='Time', every='1s')
 
-        # 步骤 5: 对所有空值（来自异常点和重采样）进行一次性插值
+        # 步骤 5: 对所有空值（来自异常点和重采样）进行一次性填充
+        # - ID列使用前向填充
+        # - 特征列使用线性插值
         resampled_df = resampled_df.with_columns(
+            pl.col("Unique_ID").forward_fill(),
             pl.col(features).interpolate(method='linear').backward_fill().forward_fill()
         )
 
