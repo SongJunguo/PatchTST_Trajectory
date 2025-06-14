@@ -23,7 +23,7 @@ OUTPUT_FORMAT="csv"
 
 # 4. 编码检测优先级
 #    可选项: 'gbk' 或 'utf8'。脚本会优先尝试此编码，失败后尝试另一种。
-ENCODING_PRIORITY="utf8"
+ENCODING_PRIORITY="gbk"
 
 # 5. 轨迹切分时间间隔 (分钟)
 #    如果两个连续点的时间差超过此值，则切分为新航段。
@@ -38,8 +38,8 @@ LOG_LEVEL="INFO"
 MIN_LEN_FOR_CLEAN=792
 
 # 8. 地理和高度范围过滤参数
-H_MIN=0
-H_MAX=20000
+H_MIN=100
+H_MAX=30000
 LON_MIN=-180
 LON_MAX=180
 LAT_MIN=-90

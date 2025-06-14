@@ -25,8 +25,8 @@ FORCE_REGENERATE="true"
 
 # 4. 地理和高度范围过滤参数
 #    这些值将传递给Python脚本来过滤数据点。
-H_MIN=0
-H_MAX=20000
+H_MIN=100
+H_MAX=30000
 LON_MIN=-180
 LON_MAX=180
 LAT_MIN=-90

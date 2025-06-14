@@ -251,7 +251,8 @@ def _process_trajectory_worker(unique_id: str, temp_file_path: str, min_len_for_
 def process_flight_data(input_dir: str, output_dir: str, output_format: str,
                         h_min: float, h_max: float, lon_min: float, lon_max: float,
                         lat_min: float, lat_max: float, encoding_priority: str, max_workers: int,
-                        segment_split_minutes: int, log_level: str, min_len_for_clean: int):
+                        segment_split_minutes: int, log_level: str, min_len_for_clean: int,
+                        unique_id_strategy: str = 'numeric'):
     """
     主处理流程函数，包含了计划书中定义的四个阶段。
     """
@@ -259,7 +260,7 @@ def process_flight_data(input_dir: str, output_dir: str, output_format: str,
     setup_logging(output_dir, log_level)
 
     # 抑制来自sklearn的关于重复值的警告，这在重采样后是正常现象
-    warnings.filterwarnings("ignore", category=UserWarning)
+    # warnings.filterwarnings("ignore", category=UserWarning)
     
     logging.info("===== 开始飞行数据预处理流程 (Polars版) =====")
     
@@ -318,21 +319,46 @@ def process_flight_data(input_dir: str, output_dir: str, output_format: str,
     ]).select(
         ["ID", "Time", "Lon", "Lat", "H"]
     ).drop_nulls().filter(
+        # 增加健壮性：明确排除经纬高为0的无效填充数据
+        (pl.col("H") != 0) & (pl.col("Lon") != 0) & (pl.col("Lat") != 0) &
+        
+        # 保留原有的地理和高度范围过滤
         (pl.col("H") >= h_min) & (pl.col("H") <= h_max) &
         (pl.col("Lon") >= lon_min) & (pl.col("Lon") <= lon_max) &
         (pl.col("Lat") >= lat_min) & (pl.col("Lat") <= lat_max)
     )
 
     # 轨迹切分表达式
+    # --- 轨迹切分与ID生成 ---
+    # 步骤1: 标记时间间隔超限的点，作为新航段的起点
     segmented_lf = transformed_lf.sort("ID", "Time").with_columns(
         (
             pl.col("Time").diff().over("ID") > timedelta(minutes=segment_split_minutes)
         ).fill_null(False).alias("new_segment_marker")
-    ).with_columns(
-        pl.col("new_segment_marker").cum_sum().over("ID").alias("segment_id")  # type: ignore
-    ).with_columns(
-        (pl.col("ID").cast(pl.Utf8) + pl.lit("_") + pl.col("segment_id").cast(pl.Utf8)).alias("Unique_ID")
     )
+
+    # 步骤2: 使用累积和为每个航段生成一个数字ID
+    segmented_lf = segmented_lf.with_columns(
+        pl.col("new_segment_marker").cum_sum().over("ID").alias("segment_id")  # type: ignore
+    )
+
+    # 步骤3: 根据用户选择的策略生成最终的Unique_ID
+    if unique_id_strategy == 'numeric':
+        logging.info("使用 'numeric' 策略生成轨迹ID (例如: PlaneA_0)")
+        segmented_lf = segmented_lf.with_columns(
+            (pl.col("ID").cast(pl.Utf8) + pl.lit("_") + pl.col("segment_id").cast(pl.Utf8)).alias("Unique_ID")
+        )
+    elif unique_id_strategy == 'timestamp':
+        logging.info("使用 'timestamp' 策略生成轨迹ID (例如: PlaneA_20230101T100000M123)")
+        # 获取每个航段的第一个时间点
+        trajectory_start_time = pl.col("Time").first().over("ID", "segment_id")
+        # 将起始时间格式化为 YYYYMMDDTHHMMSS.fff 的格式，然后用'M'替换'.'
+        time_str_with_dot = trajectory_start_time.dt.strftime("%Y%m%dT%H%M%S%.3f")
+        time_str_with_M = time_str_with_dot.str.replace(r".", "M", literal=True)
+        
+        segmented_lf = segmented_lf.with_columns(
+            (pl.col("ID").cast(pl.Utf8) + pl.lit("_") + time_str_with_M).alias("Unique_ID")
+        )
 
     # --- 增加健壮性检查: 确认有数据通过了过滤 ---
     # 使用 .head(1).collect() 廉价地检查惰性框架在过滤后是否为空，避免后续在空DF上执行group_by
@@ -405,6 +431,11 @@ def process_flight_data(input_dir: str, output_dir: str, output_format: str,
             ["ID", "Time", "Lon", "Lat", "H"]
         )
         
+        # 按照用户指定的格式 'YYYYMMDD HH:MM:SS.fff' 格式化时间列
+        final_df = final_df.with_columns(
+            pl.col("Time").dt.strftime("%Y%m%d %H:%M:%S%.3f").alias("Time")
+        )
+        
         output_filename = f"processed_trajectories_polars.{output_format}"
         output_path = os.path.join(output_dir, output_filename)
         
@@ -445,6 +476,7 @@ if __name__ == '__main__':
     parser.add_argument('--segment_split_minutes', type=int, default=5, help='用于切分轨迹的时间间隔（分钟）')
     parser.add_argument('--log_level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='设置日志记录级别')
     parser.add_argument('--min_len_for_clean', type=int, default=792, help='航段进行清洗（异常检测等）所需的最小数据点数')
+    parser.add_argument('--unique_id_strategy', type=str, default='timestamp', choices=['numeric', 'timestamp'], help='生成轨迹唯一ID的策略: "numeric" (例如: PlaneA_0) 或 "timestamp" (例如: PlaneA_20230101T100000M123)')
     
     # 地理和高度过滤参数
     parser.add_argument('--h_min', type=float, default=0, help='最低高度 (米)')
@@ -476,5 +508,6 @@ if __name__ == '__main__':
         max_workers=args.max_workers,
         segment_split_minutes=args.segment_split_minutes,
         log_level=args.log_level,
-        min_len_for_clean=args.min_len_for_clean
+        min_len_for_clean=args.min_len_for_clean,
+        unique_id_strategy=args.unique_id_strategy
     )
