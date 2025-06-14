@@ -11,3 +11,6 @@ csv的空值被polars转换为null而不是nan
 
 先深度思考，使用context7，不要写代码
 
+使用context7验证你对dask和polars使用。
+还有，我希望保留现有的不适用polars的这两个文件，我后续有处理超过200gb数据的需求，可以使用现有的代码。
+你使用dask的新代码在新的py文件编写，对应的sh脚本也是新的。
