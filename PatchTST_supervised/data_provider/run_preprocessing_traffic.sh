@@ -86,7 +86,7 @@ echo ""
 echo "--- 当前工作目录: $(pwd) ---"
 echo "--- 将要执行的命令 (Polars并行版): ---"
 # 使用 printf 来更安全地打印命令，避免特殊字符问题
-printf "python PatchTST_supervised/data_provider/flight_data_preprocessor_polars.py"
+printf "python PatchTST_supervised/data_provider/flight_data_preprocessor_traffic.py"
 for arg in "${CMD_ARGS[@]}"; do
   printf " %q" "$arg"
 done
@@ -95,7 +95,7 @@ echo "------------------------------------"
 echo ""
 
 # 执行Python脚本
-python PatchTST_supervised/data_provider/flight_data_preprocessor_polars.py "${CMD_ARGS[@]}"
+python PatchTST_supervised/data_provider/flight_data_preprocessor_traffic.py "${CMD_ARGS[@]}"
 
 echo ""
 echo "--- Polars 脚本执行完毕。 ---"

@@ -404,7 +404,11 @@ def process_flight_data(input_dir: str, output_dir: str, output_format: str,
 
     try:
         logging.info("正在将分段数据写入临时文件以便并行读取...")
-        segmented_lf.sink_parquet(temp_file)
+        # 在写入临时文件前，只选择后续处理需要的列，从而丢弃不再需要的 'ID' 等列
+        final_segmented_lf = segmented_lf.select(
+            "Unique_ID", "Time", "Lon", "Lat", "H"
+        )
+        final_segmented_lf.sink_parquet(temp_file)
         
         unique_ids = pl.scan_parquet(temp_file).select("Unique_ID").unique().collect()["Unique_ID"].to_list()
         
