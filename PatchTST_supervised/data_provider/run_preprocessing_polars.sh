@@ -45,6 +45,13 @@ LON_MAX=180
 LAT_MIN=-90
 LAT_MAX=90
 
+# 9. 新增功能开关
+#    ID生成策略。可选项: 'numeric' 或 'timestamp'
+UNIQUE_ID_STRATEGY="timestamp"
+#    保存调试文件。可选项: "true" 或 "false"
+SAVE_DEBUG_FILE="true"
+
+
 # --- 脚本执行逻辑 (一般无需修改) ---
 
 # 检查输入目录是否存在
@@ -53,38 +60,42 @@ if [ ! -d "$INPUT_DIR" ]; then
     exit 1
 fi
 
+# 使用数组构建参数，以便更健壮地处理可选参数
+CMD_ARGS=(
+    --input_dir "$INPUT_DIR"
+    --output_dir "$OUTPUT_DIR"
+    --max_workers "$MAX_WORKERS"
+    --output_format "$OUTPUT_FORMAT"
+    --encoding_priority "$ENCODING_PRIORITY"
+    --h_min "$H_MIN" --h_max "$H_MAX"
+    --lon_min "$LON_MIN" --lon_max "$LON_MAX"
+    --lat_min "$LAT_MIN" --lat_max "$LAT_MAX"
+    --segment_split_minutes "$SEGMENT_SPLIT_MINUTES"
+    --log_level "$LOG_LEVEL"
+    --min_len_for_clean "$MIN_LEN_FOR_CLEAN"
+    --unique_id_strategy "$UNIQUE_ID_STRATEGY"
+)
+
+# 如果 SAVE_DEBUG_FILE 设置为 "true"，则添加调试标志
+if [ "$SAVE_DEBUG_FILE" = "true" ]; then
+    CMD_ARGS+=(--save_debug_segmented_file)
+fi
+
 # 打印将要执行的命令，方便调试
 echo ""
 echo "--- 当前工作目录: $(pwd) ---"
 echo "--- 将要执行的命令 (Polars并行版): ---"
-echo "python PatchTST_supervised/data_provider/flight_data_preprocessor_polars.py \\"
-echo "    --input_dir \"$INPUT_DIR\" \\"
-echo "    --output_dir \"$OUTPUT_DIR\" \\"
-echo "    --max_workers $MAX_WORKERS \\"
-echo "    --output_format \"$OUTPUT_FORMAT\" \\"
-echo "    --encoding_priority \"$ENCODING_PRIORITY\" \\"
-echo "    --h_min $H_MIN --h_max $H_MAX \\"
-echo "    --lon_min $LON_MIN --lon_max $LON_MAX \\"
-echo "    --lat_min $LAT_MIN --lat_max $LAT_MAX \\"
-echo "    --segment_split_minutes $SEGMENT_SPLIT_MINUTES \\"
-echo "    --log_level \"$LOG_LEVEL\" \\"
-echo "    --min_len_for_clean $MIN_LEN_FOR_CLEAN"
+# 使用 printf 来更安全地打印命令，避免特殊字符问题
+printf "python PatchTST_supervised/data_provider/flight_data_preprocessor_polars.py"
+for arg in "${CMD_ARGS[@]}"; do
+  printf " %q" "$arg"
+done
+echo ""
 echo "------------------------------------"
 echo ""
 
 # 执行Python脚本
-python PatchTST_supervised/data_provider/flight_data_preprocessor_polars.py \
-    --input_dir "$INPUT_DIR" \
-    --output_dir "$OUTPUT_DIR" \
-    --max_workers "$MAX_WORKERS" \
-    --output_format "$OUTPUT_FORMAT" \
-    --encoding_priority "$ENCODING_PRIORITY" \
-    --h_min "$H_MIN" --h_max "$H_MAX" \
-    --lon_min "$LON_MIN" --lon_max "$LON_MAX" \
-    --lat_min "$LAT_MIN" --lat_max "$LAT_MAX" \
-    --segment_split_minutes "$SEGMENT_SPLIT_MINUTES" \
-    --log_level "$LOG_LEVEL" \
-    --min_len_for_clean "$MIN_LEN_FOR_CLEAN"
+python PatchTST_supervised/data_provider/flight_data_preprocessor_polars.py "${CMD_ARGS[@]}"
 
 echo ""
 echo "--- Polars 脚本执行完毕。 ---"

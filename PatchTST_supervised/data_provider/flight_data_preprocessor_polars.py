@@ -252,7 +252,7 @@ def process_flight_data(input_dir: str, output_dir: str, output_format: str,
                         h_min: float, h_max: float, lon_min: float, lon_max: float,
                         lat_min: float, lat_max: float, encoding_priority: str, max_workers: int,
                         segment_split_minutes: int, log_level: str, min_len_for_clean: int,
-                        unique_id_strategy: str = 'numeric'):
+                        unique_id_strategy: str = 'numeric', save_debug_segmented_file: bool = False):
     """
     主处理流程函数，包含了计划书中定义的四个阶段。
     """
@@ -306,6 +306,10 @@ def process_flight_data(input_dir: str, output_dir: str, output_format: str,
     lazy_df = pl.concat(lazy_frames)
 
     # --- 阶段二: 核心转换 (Lazy & Parallel) ---
+    logging.info("正在统计原始数据点总数...")
+    total_raw_rows = lazy_df.select(pl.len()).collect().item()
+    logging.info(f"所有CSV文件共包含 {total_raw_rows:,} 个原始数据点。")
+
     logging.info("--- 阶段二: 正在执行惰性数据转换与轨迹切分... ---")
     
     # 核心转换表达式链
@@ -328,7 +332,6 @@ def process_flight_data(input_dir: str, output_dir: str, output_format: str,
         (pl.col("Lat") >= lat_min) & (pl.col("Lat") <= lat_max)
     )
 
-    # 轨迹切分表达式
     # --- 轨迹切分与ID生成 ---
     # 步骤1: 标记时间间隔超限的点，作为新航段的起点
     segmented_lf = transformed_lf.sort("ID", "Time").with_columns(
@@ -361,10 +364,36 @@ def process_flight_data(input_dir: str, output_dir: str, output_format: str,
         )
 
     # --- 增加健壮性检查: 确认有数据通过了过滤 ---
-    # 使用 .head(1).collect() 廉价地检查惰性框架在过滤后是否为空，避免后续在空DF上执行group_by
-    if segmented_lf.head(1).collect().is_empty():
+    logging.info("正在统计过滤和切分后的有效数据点总数...")
+    # 注意：这次 collect 会触发完整的计算计划，但只为了获取行数，开销可控
+    total_processed_rows = segmented_lf.select(pl.len()).collect(engine='streaming').item()
+    logging.info(f"经过过滤和轨迹切分后，剩余 {total_processed_rows:,} 个有效数据点。")
+    if total_raw_rows > 0:
+        logging.info(f"数据保留率: {total_processed_rows / total_raw_rows:.2%}")
+
+    if total_processed_rows == 0:
         logging.warning("所有数据均在初始过滤阶段（如地理范围、有效日期等）被移除。没有可处理的航段。程序终止。")
         return
+
+    # --- (可选) 保存用于调试的中间文件 ---
+    if save_debug_segmented_file:
+        logging.info("正在以流式方式生成用于调试的航段分割文件 (内存安全)...")
+        
+        # 准备最终的 LazyFrame，包含所有需要的列选择和格式化逻辑
+        debug_lf_to_save = segmented_lf.select(
+            pl.col("Unique_ID").alias("ID"),
+            pl.col("Time").dt.strftime("%Y-%m-%d %H:%M:%S%.3f").alias("Time"), # 使用人类可读的时间格式
+            "Lon", "Lat", "H",
+            pl.col("ID").alias("Original_Plane_ID") # 保留原始飞机ID以供参考
+        )
+        
+        # 定义输出路径并以流式方式写入，避免高内存占用
+        debug_output_path = os.path.join(output_dir, "segmented_for_visualization.csv")
+        try:
+            debug_lf_to_save.sink_csv(debug_output_path)
+            logging.info(f"成功！已保存调试文件到: {debug_output_path}")
+        except Exception as e:
+            logging.error(f"保存调试文件失败: {e}", exc_info=True)
 
     # --- 阶段三: 真正的并行化平滑处理 ---
     logging.info("--- 阶段三: 准备进行并行化平滑处理... ---")
@@ -476,7 +505,8 @@ if __name__ == '__main__':
     parser.add_argument('--segment_split_minutes', type=int, default=5, help='用于切分轨迹的时间间隔（分钟）')
     parser.add_argument('--log_level', type=str, default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='设置日志记录级别')
     parser.add_argument('--min_len_for_clean', type=int, default=792, help='航段进行清洗（异常检测等）所需的最小数据点数')
-    parser.add_argument('--unique_id_strategy', type=str, default='timestamp', choices=['numeric', 'timestamp'], help='生成轨迹唯一ID的策略: "numeric" (例如: PlaneA_0) 或 "timestamp" (例如: PlaneA_20230101T100000M123)')
+    parser.add_argument('--unique_id_strategy', type=str, default='numeric', choices=['numeric', 'timestamp'], help='生成轨迹唯一ID的策略: "numeric" (例如: PlaneA_0) 或 "timestamp" (例如: PlaneA_20230101T100000M123)')
+    parser.add_argument('--save_debug_segmented_file', action='store_true', help='如果设置，将在航段切分后保存一个用于调试的CSV文件')
     
     # 地理和高度过滤参数
     parser.add_argument('--h_min', type=float, default=0, help='最低高度 (米)')
@@ -509,5 +539,6 @@ if __name__ == '__main__':
         segment_split_minutes=args.segment_split_minutes,
         log_level=args.log_level,
         min_len_for_clean=args.min_len_for_clean,
-        unique_id_strategy=args.unique_id_strategy
+        unique_id_strategy=args.unique_id_strategy,
+        save_debug_segmented_file=args.save_debug_segmented_file
     )
