@@ -2,18 +2,19 @@
 # ==============================================================================
 # ** 高性能飞行数据预处理器 (Polars/Traffic版) **
 #
-# ** 版本: 2.0 **
+# ** 版本: 2.1 (Final) **
 #
 # ** 依赖项: **
-#   pip install polars numpy tqdm psutil traffic
+#   pip install polars numpy tqdm psutil traffic pandas
 #
 # ** 运行说明: **
-#   python flight_data_preprocessor_polars.py --input_dir [输入目录] --output_dir [输出目录]
+#   python flight_data_preprocessor_traffic.py --input_dir [输入目录] --output_dir [输出目录]
 #
 # ** 核心改进点 (与原版对比): **
 #   - 使用 traffic 库替换了自定义的平滑和清理函数。
 #   - 采用多阶段滤波策略（去离群点 -> 预平滑 -> 特征工程 -> 全局平滑），
 #     以稳健地处理高噪声数据。
+#   - 增加保存预处理中间文件的功能，便于对比分析。
 # ==============================================================================
 
 # 1. Imports
@@ -39,7 +40,7 @@ from traffic.core import Flight
 # 2. Logging Setup
 def setup_logging(log_dir: str, log_level: str):
     """配置日志，使其同时输出到控制台和文件。"""
-    log_filename = os.path.join(log_dir, "polars_preprocessing.log")
+    log_filename = os.path.join(log_dir, "traffic_preprocessing.log")
 
     # 确保日志目录存在
     os.makedirs(log_dir, exist_ok=True)
@@ -83,7 +84,7 @@ def dms_to_decimal_expr(dms_col: str) -> pl.Expr:
 
 def _process_trajectory_worker_traffic(
     unique_id: str, temp_file_path: str, min_len_for_clean: int
-) -> Optional[pl.DataFrame]:
+) -> Optional[tuple[pl.DataFrame, pl.DataFrame]]:
     """
     使用 traffic 库处理单个航段的工作函数。
     遵循“预处理 -> 特征工程 -> 标准化 -> 全局平滑”的四阶段流程。
@@ -151,13 +152,25 @@ def _process_trajectory_worker_traffic(
             return None
 
         # --- 第四阶段: 全局最优平滑 ---
+        # 卡尔曼滤波器在笛卡尔坐标系下工作，需要先进行坐标转换
+        flight_with_xy = resampled_flight.compute_xy()
         final_smoother = KalmanSmoother6D()
-        final_flight = resampled_flight.filter(final_smoother)
+        final_flight = flight_with_xy.filter(final_smoother)
         if final_flight is None:
             return None
 
-        # 返回处理后的干净数据
-        # 将列名改回原始脚本的格式以便后续步骤统一处理
+        # 为对比准备预处理后的数据
+        preprocessed_df_pandas = flight_pre_filtered.data.rename(
+            columns={
+                "timestamp": "Time",
+                "longitude": "Lon",
+                "latitude": "Lat",
+                "altitude": "H",
+                "flight_id": "Unique_ID",
+            }
+        )
+
+        # 准备最终平滑后的数据
         final_df_pandas = final_flight.data.rename(
             columns={
                 "timestamp": "Time",
@@ -167,7 +180,12 @@ def _process_trajectory_worker_traffic(
                 "flight_id": "Unique_ID",
             }
         )
-        return pl.from_pandas(final_df_pandas)
+
+        # 以元组形式返回两个DataFrame
+        return (
+            pl.from_pandas(preprocessed_df_pandas),
+            pl.from_pandas(final_df_pandas),
+        )
 
     except Exception as e:
         logging.error(
@@ -280,7 +298,6 @@ def process_flight_data(
         .select(["ID", "Time", "Lon", "Lat", "H"])
         .drop_nulls()
         .filter(
-            # 增加健壮性：明确排除经纬高为0的无效填充数据
             # 注意：这里的0值过滤是第一道防线，更精细的处理在worker函数中完成
             (pl.col("H") != 0)
             & (pl.col("Lon") != 0)
@@ -388,7 +405,8 @@ def process_flight_data(
     logging.info("--- 阶段三: 准备进行并行化平滑处理... ---")
 
     temp_file = os.path.join(output_dir, "_temp_segmented_data.parquet")
-    all_processed_dfs = []
+    all_preprocessed_dfs = []
+    all_final_dfs = []
     executor = ProcessPoolExecutor(max_workers=max_workers)
 
     try:
@@ -424,12 +442,16 @@ def process_flight_data(
 
         skipped_short_count = 0
         with tqdm(total=len(unique_ids), desc="并行处理航段") as pbar:
-            for result_df in executor.map(worker_func, unique_ids):
-                if result_df is None:
+            for result in executor.map(worker_func, unique_ids):
+                if result is None:
                     skipped_short_count += 1
-                elif not result_df.is_empty():
-                    all_processed_dfs.append(result_df)
-                # is_empty() 且 not None 的情况意味着UDF内部发生错误并返回了None
+                else:
+                    preprocessed_df, final_df = result
+                    if not preprocessed_df.is_empty():
+                        all_preprocessed_dfs.append(preprocessed_df)
+                    if not final_df.is_empty():
+                        all_final_dfs.append(final_df)
+
                 pbar.update(1)
 
         executor.shutdown(wait=True)  # Clean shutdown on success
@@ -450,32 +472,46 @@ def process_flight_data(
             os.remove(temp_file)
             logging.info(f"已清理临时文件: {temp_file}")
 
-    if not all_processed_dfs:
+    if not all_final_dfs:
         logging.warning("所有航段处理后均为空，没有可保存的数据。")
         return
-
-    processed_df = pl.concat(all_processed_dfs)
 
     # --- 阶段四: 保存结果 ---
     logging.info("--- 阶段四: 正在保存最终结果... ---")
 
-    if processed_df.is_empty():
-        logging.warning("处理后没有可保存的数据。")
-    else:
-        # traffic 处理后列名已经是标准的，只需选择需要的列
-        # 注意：列名在 worker 函数中已经改回 "Time", "Lon", "Lat", "H", "Unique_ID"
-        final_df = processed_df.rename({"Unique_ID": "ID"}).select(
+    # 保存用于对比的预处理后文件
+    if all_preprocessed_dfs:
+        preprocessed_df = pl.concat(all_preprocessed_dfs)
+        preprocessed_df = preprocessed_df.rename({"Unique_ID": "ID"}).select(
             ["ID", "Time", "Lon", "Lat", "H"]
         )
+        preprocessed_output_path = os.path.join(
+            output_dir, f"preprocessed_for_comparison.{output_format}"
+        )
+        try:
+            if output_format == "csv":
+                preprocessed_df.write_csv(preprocessed_output_path)
+            elif output_format == "parquet":
+                preprocessed_df.write_parquet(preprocessed_output_path)
+            logging.info(
+                f"成功！已保存预处理对比文件到: {preprocessed_output_path}"
+            )
+        except Exception as e:
+            logging.error(f"保存预处理对比文件时失败: {e}")
 
-        # 按照用户指定的格式 'YYYYMMDD HH:MM:SS.fff' 格式化时间列
+    # 保存最终平滑后的文件
+    final_concat_df = pl.concat(all_final_dfs)
+    if final_concat_df.is_empty():
+        logging.warning("最终平滑处理后没有可保存的数据。")
+    else:
+        final_df = final_concat_df.rename({"Unique_ID": "ID"}).select(
+            ["ID", "Time", "Lon", "Lat", "H"]
+        )
         final_df = final_df.with_columns(
             pl.col("Time").dt.strftime("%Y%m%d %H:%M:%S%.3f").alias("Time")
         )
-
-        output_filename = f"processed_trajectories_polars.{output_format}"
+        output_filename = f"final_processed_trajectories.{output_format}"
         output_path = os.path.join(output_dir, output_filename)
-
         try:
             if output_format == "csv":
                 final_df.write_csv(output_path)
@@ -483,10 +519,10 @@ def process_flight_data(
                 final_df.write_parquet(output_path)
 
             logging.info(
-                f"成功！已保存 {final_df['ID'].n_unique()} 条处理后的轨迹到 {output_path}"
+                f"成功！已保存 {final_df['ID'].n_unique()} 条最终处理后的轨迹到 {output_path}"
             )
         except Exception as e:
-            logging.error(f"保存文件到 {output_path} 时失败: {e}")
+            logging.error(f"保存最终文件到 {output_path} 时失败: {e}")
 
     if failed_files:
         logging.warning("以下文件在读取过程中失败，已被跳过:")

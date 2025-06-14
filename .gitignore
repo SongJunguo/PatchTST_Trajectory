@@ -1,5 +1,6 @@
 # Created by https://www.toptal.com/developers/gitignore/api/emacs,jetbrains+all,jupyternotebooks,linux,macos,microsoftoffice,notepadpp,python,tortoisegit,vim,visualstudiocode,windows
 # Edit at https://www.toptal.com/developers/gitignore?templates=emacs,jetbrains+all,jupyternotebooks,linux,macos,microsoftoffice,notepadpp,python,tortoisegit,vim,visualstudiocode,windows
+*.tar.gz
 
 dl_data_env/
 
@@ -493,3 +494,4 @@ PatchTST_supervised/test_results/
 *.tmp
 *.bak
 *~
+

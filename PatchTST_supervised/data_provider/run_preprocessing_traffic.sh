@@ -1,17 +1,19 @@
 #!/bin/bash
 
 # ==============================================================================
-# 高性能飞行数据预处理一键运行脚本 (Polars版) - v4 (真正并行化)
+# 高性能飞行数据预处理一键运行脚本 (Traffic版) - v4 (真正并行化)
 # ==============================================================================
 
 # --- 说明 ---
 # 脚本应从项目根目录 (PatchTST/) 运行。
 
+#清理终端输出
+clear 
 # --- 可配置参数 ---
 
 # 1. 输入和输出目录 (路径相对于项目根目录)
 INPUT_DIR="./PatchTST_supervised/dataset/raw/"
-OUTPUT_DIR="./PatchTST_supervised/dataset/processed_data_polars/"
+OUTPUT_DIR="./PatchTST_supervised/dataset/processed_data_traffic/"
 
 # 2. 并行处理的工作进程数
 #    建议设置为您的CPU核心数。
@@ -84,7 +86,7 @@ fi
 # 打印将要执行的命令，方便调试
 echo ""
 echo "--- 当前工作目录: $(pwd) ---"
-echo "--- 将要执行的命令 (Polars并行版): ---"
+echo "--- 将要执行的命令 (Traffic并行版): ---"
 # 使用 printf 来更安全地打印命令，避免特殊字符问题
 printf "python PatchTST_supervised/data_provider/flight_data_preprocessor_traffic.py"
 for arg in "${CMD_ARGS[@]}"; do
@@ -98,4 +100,4 @@ echo ""
 python PatchTST_supervised/data_provider/flight_data_preprocessor_traffic.py "${CMD_ARGS[@]}"
 
 echo ""
-echo "--- Polars 脚本执行完毕。 ---"
+echo "--- Traffic 脚本执行完毕。 ---"
