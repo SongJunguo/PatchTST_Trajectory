@@ -2,7 +2,7 @@
 # ==============================================================================
 # ** 高性能飞行数据预处理器 (Polars/Traffic版) **
 #
-# ** 版本: 2.3 (Final with robust error handling) **
+# ** 版本: 2.4 (Final with NaN trimming) **
 #
 # ** 依赖项: **
 #   pip install polars numpy tqdm psutil traffic pandas
@@ -15,6 +15,7 @@
 #   - 采用多阶段滤波策略（去离群点 -> 预平滑 -> 特征工程 -> 全局平滑）。
 #   - 增加保存预处理中间文件的功能，便于对比分析。
 #   - 实现了健壮的错误捕获和日志记录机制。
+#   - 增加删除边界NaN的功能，避免不合理的填充。
 # ==============================================================================
 
 # 1. Imports
@@ -31,7 +32,6 @@ import polars as pl
 from tqdm import tqdm
 
 import numpy as np
-from traffic.algorithms.filters import FilterAboveSigmaMedian, FilterMedian
 from traffic.algorithms.filters.kalman import KalmanSmoother6D
 from traffic.core import Flight
 
@@ -82,7 +82,11 @@ def dms_to_decimal_expr(dms_col: str) -> pl.Expr:
 
 
 def _process_trajectory_worker_traffic(
-    unique_id: str, temp_file_path: str, min_len_for_clean: int
+    unique_id: str,
+    temp_file_path: str,
+    min_len_for_clean: int,
+    min_valid_block_len: int,
+    resample_freq: str,
 ) -> dict:
     """
     使用 traffic 库处理单个航段的工作函数。
@@ -97,18 +101,11 @@ def _process_trajectory_worker_traffic(
             .collect()
         )
 
-        if (
-            trajectory_df_polars.is_empty()
-            or len(trajectory_df_polars) < min_len_for_clean
-        ):
-            return {"status": "skipped", "reason": "too short"}
+        if trajectory_df_polars.is_empty():
+            return {"status": "skipped", "reason": "empty before processing"}
 
         # 转换为 Pandas DataFrame 以便使用 traffic 库
         pandas_df = trajectory_df_polars.to_pandas()
-
-        # 将填充值 0 替换为 NaN，以便 traffic 正确处理
-        for col in ["Lon", "Lat", "H"]:
-            pandas_df[col] = pandas_df[col].replace(0, np.nan)
 
         # 重命名列以符合 traffic 的标准
         flight_df = pandas_df.rename(
@@ -121,17 +118,127 @@ def _process_trajectory_worker_traffic(
             }
         )
 
+        # --- 数据清洗步骤 1 & 2: 处理重复和静态数据点 ---
+        # 理由: 保证每个时间戳唯一，并移除冗余的静态数据点，以确保后续计算的有效性。
+
+        # 步骤 1: 中位数聚合处理重复时间戳
+        if flight_df.timestamp.duplicated().any():
+            logging.info(
+                f"轨迹ID '{unique_id}' 检测到重复时间戳，将执行中位数聚合..."
+            )
+            flight_df = (
+                flight_df.groupby("timestamp")
+                .agg(
+                    {
+                        "longitude": "median",
+                        "latitude": "median",
+                        "altitude": "median",
+                        "flight_id": "first",
+                    }
+                )
+                .reset_index()
+            )
+
+        # 步骤 2: 静态数据点去重
+        static_cols = ["longitude", "latitude", "altitude"]
+        has_changed = flight_df[static_cols].diff().abs().sum(axis=1) > 0
+
+        # 使用.loc来避免FutureWarning
+        shifted = has_changed.shift(1)
+        shifted.loc[shifted.isna()] = True
+        is_first_in_static_segment = shifted.astype(bool)
+
+        rows_to_keep = has_changed | is_first_in_static_segment
+
+        original_rows = len(flight_df)
+        flight_df = flight_df[rows_to_keep]
+        new_rows = len(flight_df)
+
+        if original_rows > new_rows:
+            logging.info(
+                f"轨迹ID '{unique_id}' 清理了 {original_rows - new_rows} 个连续的静态数据点。"
+            )
+
+        # --- 清洗结束: 强制统一列顺序 ---
+        # 理由: 确保无论是否经过groupby，列顺序都保持一致，避免后续concat失败。
+        flight_df = flight_df[
+            ["timestamp", "longitude", "latitude", "altitude", "flight_id"]
+        ]
+
         # 创建 Flight 对象
         flight = Flight(flight_df)
 
-        # --- 第一阶段: 强力预处理 ---
-        pre_filter = FilterAboveSigmaMedian() | FilterMedian()
-        flight_pre_filtered = flight.filter(pre_filter, strategy=None)
-        if flight_pre_filtered is None:
-            return {"status": "skipped", "reason": "empty after pre-filtering"}
+        # --- 第一阶段: 强力预处理与边界清理 ---
+        # pre_filter = FilterAboveSigmaMedian() | FilterMedian()
+        # pre_filter = FilterMedian()
+        # flight_pre_filtered = flight.filter(pre_filter, strategy=None)
+        # if flight_pre_filtered is None:
+        #     return {"status": "skipped", "reason": "empty after pre-filtering"}
+        flight_pre_filtered = flight
+        # 清理边界NaN: 根据至少3个连续有效点的原则，删除轨迹开头和结尾的连续NaN值
+        pre_filtered_df = flight_pre_filtered.data
+
+        # 步骤2.1: 处理轨迹首尾的连续缺失值
+        # 理由: 确保每条轨迹都有一个“干净”的开头和结尾，至少包含3个连续的有效点，
+        # 这是后续算法（如卡尔曼滤波器）正常初始化和运行的硬性要求。
+        key_cols = ["altitude", "longitude", "latitude"]
+        is_valid = pre_filtered_df[key_cols].notna().all(axis=1)
+
+        # 至少需要 min_valid_block_len 个有效点才能形成一个块
+        if is_valid.sum() < min_valid_block_len:
+            return {
+                "status": "skipped",
+                "reason": f"fewer than {min_valid_block_len} valid data points in total",
+            }
+
+        # 使用滚动窗口找到所有连续 min_valid_block_len 个有效点的块的结束位置 (使用整数位置)
+        rolling_sum = is_valid.rolling(
+            window=min_valid_block_len, min_periods=min_valid_block_len
+        ).sum()
+        valid_block_end_ilocs = np.where(
+            rolling_sum.to_numpy() == min_valid_block_len
+        )[0]
+
+        # 如果找不到任何这样的块，则跳过
+        if len(valid_block_end_ilocs) == 0:
+            return {
+                "status": "skipped",
+                "reason": f"no block of {min_valid_block_len} consecutive valid points found",
+            }
+
+        # 确定裁剪的开始和结束整数位置
+        # 开始位置是第一个有效块的第一个点
+        first_valid_block_end_iloc = valid_block_end_ilocs[0]
+        start_iloc = first_valid_block_end_iloc - (min_valid_block_len - 1)
+
+        # 结束位置是最后一个有效块的最后一个点
+        end_iloc = valid_block_end_ilocs[-1]
+
+        # 使用 .iloc 进行切片，确保我们选择的是一个连续的数据块
+        trimmed_df = pre_filtered_df.iloc[start_iloc : end_iloc + 1]
+
+        if trimmed_df.empty:
+            return {
+                "status": "skipped",
+                "reason": "empty after trimming leading/trailing NaNs",
+            }
+
+        # 在清理边界后，再次检查航段长度是否满足后续处理的要求
+        if len(trimmed_df) < min_len_for_clean:
+            return {
+                "status": "skipped",
+                "reason": f"too short after trimming (len={len(trimmed_df)} < {min_len_for_clean})",
+            }
+
+        flight_trimmed = Flight(trimmed_df)
 
         # --- 第二阶段: 可靠的特征工程 ---
-        flight_with_dynamics = flight_pre_filtered.cumulative_distance().rename(
+        # 关键修正: traffic库默认高度单位为英尺，在此处将米转换为英尺
+        flight_trimmed = flight_trimmed.assign(
+            altitude=lambda df: df.altitude
+            / 0.3048  # 1 foot = 0.3048 meters exactly
+        )
+        flight_with_dynamics = flight_trimmed.cumulative_distance().rename(
             columns={"compute_gs": "groundspeed", "compute_track": "track"}
         )
         time_diff_seconds = (
@@ -146,24 +253,95 @@ def _process_trajectory_worker_traffic(
             vertical_rate=vertical_rate
         )
 
-        # --- 第三阶段: 标准化与最终填充 ---
-        resampled_flight = flight_with_dynamics.resample("1s")
+        # --- 第三阶段: 标准化 ---
+        # resample 会自动插值填充内部的 NaN
+        resampled_flight = flight_with_dynamics.resample(resample_freq)
         if resampled_flight is None:
             return {"status": "skipped", "reason": "empty after resampling"}
 
-        # 强制填充所有可能存在的NaN值，确保进入最终滤波器的数据是完整的
-        filled_data = resampled_flight.data.copy()
-        # 对所有数值类型的列应用三步填充策略
-        numeric_cols = filled_data.select_dtypes(include=np.number).columns
-        filled_data[numeric_cols] = (
-            filled_data[numeric_cols].interpolate().ffill().bfill()
-        )
-        resampled_flight_filled = Flight(filled_data)
+        # --- (新增) 健壮性检查: 验证重采样和插值后是否存在NaN ---
+        # 理由: 确保 traffic 的 resample/interpolate 行为符合预期，没有留下任何NaN。
+        # 这有助于在早期阶段发现数据问题，而不是等到最终的卡尔曼滤波器步骤。
+        resampled_df = resampled_flight.data
+        # 检查除flight_id之外的所有列
+        nan_check_cols = resampled_df.columns.drop("flight_id")
+        nan_in_cols = [
+            col for col in nan_check_cols if resampled_df[col].isnull().any()
+        ]
+
+        if nan_in_cols:
+            logging.warning(
+                f"严重警告: 轨迹ID '{unique_id}' 在重采样(resample)后，以下数据列仍检测到NaN值: {nan_in_cols}。"
+                " 这可能表明插值未能覆盖所有间隙。后续流程将尝试修复。"
+            )
 
         # --- 第四阶段: 全局最优平滑 ---
         # 卡尔曼滤波器在笛卡尔坐标系下工作，需要先进行坐标转换
-        flight_with_xy = resampled_flight_filled.compute_xy()
+        flight_with_xy = resampled_flight.compute_xy()
         final_smoother = KalmanSmoother6D()
+
+        # --- 健壮性检查与强制清理: 在滤波前确保数据有效 ---
+        # 理由: 卡尔曼滤波器对NaN或inf值非常敏感，会导致矩阵运算失败。
+        # 即使经过resample，某些边缘情况或上游计算仍可能引入无效值。
+        df_to_clean = flight_with_xy.data
+        key_cols_for_smoothing = [
+            "x",
+            "y",
+            "altitude",
+            "groundspeed",
+            "vertical_rate",
+        ]
+
+        # 检查是否存在NaN或inf
+        problematic_cols = []
+        for col in key_cols_for_smoothing:
+            # 直接在Pandas DataFrame上检查，而不是在NumPy数组上
+            if (
+                df_to_clean[col].isnull().any()
+                or np.isinf(df_to_clean[col]).any()
+            ):
+                problematic_cols.append(col)
+
+        if problematic_cols:
+            logging.critical(
+                f"严重警告: 轨迹ID '{unique_id}' 在送入卡尔曼滤波器前检测到NaN或inf值！"
+                f" 这很可能导致 'matmul' 错误。问题列: {problematic_cols}"
+            )
+
+        # 强制进行稳健的插值和填充，以消除任何剩余的无效值
+        # 1. 线性插值
+        # 2. 向前填充
+        # 3. 向后填充 (确保开头没有NaN)
+        df_to_clean[key_cols_for_smoothing] = (
+            df_to_clean[key_cols_for_smoothing]
+            .interpolate(method="linear", limit_direction="both")
+            .ffill()
+            .bfill()
+        )
+
+        flight_with_xy = Flight(df_to_clean)
+        # --- 清理结束 ---
+
+        # --- (新增) 卡尔曼滤波器健壮性补丁 ---
+        # 理由: 如果高度长时间不变，其标准差为0，会导致卡尔曼滤波器内部的R矩阵
+        #      在对应维度上为0，进而可能导致S矩阵奇异，求逆失败产生NaN。
+        # 补丁: 在送入滤波器前，检查高度标准差。如果接近于0，则加入微小噪声。
+        df_for_smoothing = flight_with_xy.data
+        # 使用一个足够小的阈值来判断标准差是否接近于零
+        if df_for_smoothing["altitude"].std() < 1e-6:
+            logging.warning(
+                f"轨迹ID '{unique_id}' 的高度数据几乎没有变化。为防止卡尔曼滤波器数值不稳定，"
+                "将向高度列添加微小的随机噪声。"
+            )
+            # 创建一个与DataFrame长度相同的、非常小的噪声
+            noise = np.random.normal(0, 1e-6, len(df_for_smoothing))
+            # 使用 .loc 避免 SettingWithCopyWarning
+            df_for_smoothing.loc[:, "altitude"] = (
+                df_for_smoothing["altitude"] + noise
+            )
+            flight_with_xy = Flight(df_for_smoothing)
+        # --- 补丁结束 ---
+
         final_flight = flight_with_xy.filter(final_smoother)
         if final_flight is None:
             return {
@@ -171,8 +349,19 @@ def _process_trajectory_worker_traffic(
                 "reason": "empty after final smoothing",
             }
 
+        # --- 第五阶段: 单位转换与输出准备 ---
+        # 在保存前，将高度从英尺转换回米，以保持与输入数据的一致性
+        final_flight_meters = final_flight.assign(
+            altitude=lambda df: df.altitude * 0.3048
+        )
+        # 对比文件也需要转换回来
+        flight_trimmed_meters = flight_trimmed.assign(
+            altitude=lambda df: df.altitude * 0.3048
+        )
+
         # 为对比准备预处理后的数据
-        preprocessed_df_pandas = flight_pre_filtered.data.rename(
+        # 注意：我们使用裁剪后的 flight_trimmed 的数据作为对比基准
+        preprocessed_df_pandas = flight_trimmed_meters.data.rename(
             columns={
                 "timestamp": "Time",
                 "longitude": "Lon",
@@ -183,7 +372,7 @@ def _process_trajectory_worker_traffic(
         )
 
         # 准备最终平滑后的数据
-        final_df_pandas = final_flight.data.rename(
+        final_df_pandas = final_flight_meters.data.rename(
             columns={
                 "timestamp": "Time",
                 "longitude": "Lon",
@@ -192,6 +381,20 @@ def _process_trajectory_worker_traffic(
                 "flight_id": "Unique_ID",
             }
         )
+
+        # --- 第六阶段 (新增): Worker内部的零容忍预检查 ---
+        # 在将数据返回给主进程前，进行一次快速预检。
+        # 这是第一道防线，确保从worker流出的数据是干净的。
+        check_cols = ["Lon", "Lat", "H"]
+        if final_df_pandas[check_cols].isnull().values.any():
+            logging.critical(
+                f"严重警告: 轨迹ID '{unique_id}' 在工作进程内部的最终检查中发现残留NaN值！"
+                " 该轨迹将被丢弃。这表明平滑或插值步骤可能存在问题。"
+            )
+            return {
+                "status": "error",
+                "reason": "Post-smoothing NaN check failed inside worker",
+            }
 
         return {
             "status": "success",
@@ -222,11 +425,13 @@ def process_flight_data(
     lat_max: float,
     encoding_priority: str,
     max_workers: int,
-    segment_split_minutes: int,
+    segment_split_seconds: int,
     log_level: str,
     min_len_for_clean: int,
+    min_valid_block_len: int,
     unique_id_strategy: str = "numeric",
     save_debug_segmented_file: bool = False,
+    resample_freq: str = "1s",
 ):
     """
     主处理流程函数，包含了计划书中定义的四个阶段。
@@ -235,6 +440,13 @@ def process_flight_data(
     setup_logging(output_dir, log_level)
 
     logging.info("===== 开始飞行数据预处理流程 (Polars/Traffic版) =====")
+
+    # --- 记录所有可调参数 ---
+    logging.info("--- 运行参数配置 ---")
+    args_dict = locals()
+    for key, value in args_dict.copy().items():
+        logging.info(f"  - {key}: {value}")
+    logging.info("--------------------")
 
     # --- 阶段一: 并行读取与预检 ---
     logging.info(f"--- 阶段一: 正在从 {input_dir} 扫描CSV文件... ---")
@@ -289,6 +501,44 @@ def process_flight_data(
     # 合并所有LazyFrames
     lazy_df = pl.concat(lazy_frames)
 
+    if log_level.upper() == "DEBUG":
+        # --- DEBUG: 检查高度列的类型转换问题 ---
+        logging.info(
+            "--- [DEBUG]  检查 'H' 列是否存在无法转换为Float64的值 ---"
+        )
+        # 使用 strict=False 来将无法转换的值变为 null，然后统计 null 的数量
+        # 我们在一个新的 LazyFrame 上操作，不影响主流程
+        height_check_lf = lazy_df.with_columns(
+            pl.col("H").cast(pl.Float64, strict=False).alias("H_casted")
+        )
+
+        # 计算转换失败的行数
+        failed_cast_count = (
+            height_check_lf.filter(
+                pl.col("H_casted").is_null() & pl.col("H").is_not_null()
+            )
+            .select(pl.len())
+            .collect(engine="streaming")
+            .item()
+        )
+
+        if failed_cast_count > 0:
+            logging.warning(
+                f"发现 {failed_cast_count} 个 'H' 列的值无法被转换为Float64。"
+            )
+            # 显示一些转换失败的例子
+            failed_examples = (
+                height_check_lf.filter(
+                    pl.col("H_casted").is_null() & pl.col("H").is_not_null()
+                )
+                .head(5)
+                .collect(engine="streaming")
+            )
+            logging.warning(f"无法转换的 'H' 列值示例:\n{failed_examples}")
+        else:
+            logging.info("'H' 列的所有值都可以被成功转换为Float64。")
+        # --- DEBUG END ---
+
     # --- 阶段二: 核心转换 (Lazy & Parallel) ---
     logging.info("正在统计原始数据点总数...")
     total_raw_rows = lazy_df.select(pl.len()).collect().item()
@@ -297,35 +547,81 @@ def process_flight_data(
     logging.info("--- 阶段二: 正在执行惰性数据转换与轨迹切分... ---")
 
     # 核心转换表达式链
-    transformed_lf = (
-        lazy_df.with_columns(
+    transformed_lf = lazy_df.with_columns(
+        [
+            # 日期解析
+            pl.col("DTRQ")
+            .str.to_datetime(format="%d-%b-%y %I.%M.%S%.f %p", strict=False)
+            .alias("Time"),
+            # 经纬度转换
+            dms_to_decimal_expr("JD").alias("Lon"),
+            dms_to_decimal_expr("WD").alias("Lat"),
+            pl.col("P1").alias("ID"),
+        ]
+    ).select(["ID", "Time", "Lon", "Lat", "H"])
+
+    if log_level.upper() == "DEBUG":
+        logging.info("--- [DEBUG]  核心转换后，清理null值前的数据状态 ---")
+        # .collect() 会触发计算，所以我们只在一个小的子集上操作
+        transformed_sample_df = transformed_lf.head(5).collect(
+            engine="streaming"
+        )
+        logging.info(f"转换后Schema: {transformed_sample_df.schema}")
+        logging.info(f"转换后前5行数据:\n{transformed_sample_df}")
+
+        # 统计null值，这会触发一次全表扫描，但对于调试是必要的
+        null_counts = transformed_lf.select(
             [
-                # 日期解析
-                pl.col("DTRQ")
-                .str.to_datetime(format="%d-%b-%y %I.%M.%S%.f %p", strict=False)
-                .alias("Time"),
-                # 经纬度转换
-                dms_to_decimal_expr("JD").alias("Lon"),
-                dms_to_decimal_expr("WD").alias("Lat"),
-                pl.col("P1").alias("ID"),
+                pl.col(c).is_null().sum().alias(f"{c}_null_count")
+                for c in transformed_lf.schema.keys()
             ]
+        ).collect(engine="streaming")
+        logging.info(f"各列的Null值统计:\n{null_counts}")
+        # --- DEBUG END ---
+
+    # 步骤 1: 清理意外的 null 值
+    df_after_drop_nulls = transformed_lf.drop_nulls()
+
+    if log_level.upper() == "DEBUG":
+        # --- DEBUG: 检查清理null值后的数据 ---
+        logging.info("--- [DEBUG]  调用 drop_nulls() 后的数据状态 ---")
+        # 同样，只对头部进行collect以避免大的性能开销
+        df_after_drop_nulls_sample = df_after_drop_nulls.head(5).collect(
+            engine="streaming"
         )
-        .select(["ID", "Time", "Lon", "Lat", "H"])
-        .drop_nulls()
-        .filter(
-            # 注意：这里的0值过滤是第一道防线，更精细的处理在worker函数中完成
-            (pl.col("H") != 0)
-            & (pl.col("Lon") != 0)
-            & (pl.col("Lat") != 0)
-            &
-            # 保留原有的地理和高度范围过滤
-            (pl.col("H") >= h_min)
-            & (pl.col("H") <= h_max)
-            & (pl.col("Lon") >= lon_min)
-            & (pl.col("Lon") <= lon_max)
-            & (pl.col("Lat") >= lat_min)
-            & (pl.col("Lat") <= lat_max)
-        )
+        logging.info(f"drop_nulls() 后前5行数据:\n{df_after_drop_nulls_sample}")
+        # --- DEBUG END ---
+
+    # 步骤 2: 增强日志统计
+    rows_after_drop_nulls = (
+        df_after_drop_nulls.select(pl.len()).collect(engine="streaming").item()
+    )
+    dropped_count = total_raw_rows - rows_after_drop_nulls
+    loss_rate = (
+        (dropped_count / total_raw_rows) * 100 if total_raw_rows > 0 else 0
+    )
+
+    logging.info("初始 `drop_nulls` 操作完成:")
+    logging.info(f"  - 原始数据点: {total_raw_rows:,}")
+    logging.info(f"  - 清理后剩余: {rows_after_drop_nulls:,}")
+    logging.info(f"  - 因null值丢弃: {dropped_count:,} ({loss_rate:.2f}%)")
+
+    # 步骤 3: 将 0 替换为 null，原始数据使用0代替nan进行缺失数值填充
+    df_with_nulls_from_zeros = df_after_drop_nulls.with_columns(
+        [
+            pl.when(pl.col(c) == 0).then(None).otherwise(pl.col(c)).alias(c)
+            for c in ["Lon", "Lat", "H"]
+        ]
+    )
+
+    # 步骤 4: 进行地理和高度范围过滤
+    transformed_lf = df_with_nulls_from_zeros.filter(
+        (pl.col("H") >= h_min)
+        & (pl.col("H") <= h_max)
+        & (pl.col("Lon") >= lon_min)
+        & (pl.col("Lon") <= lon_max)
+        & (pl.col("Lat") >= lat_min)
+        & (pl.col("Lat") <= lat_max)
     )
 
     # --- 轨迹切分与ID生成 ---
@@ -333,7 +629,7 @@ def process_flight_data(
     segmented_lf = transformed_lf.sort("ID", "Time").with_columns(
         (
             pl.col("Time").diff().over("ID")
-            > timedelta(minutes=segment_split_minutes)
+            > timedelta(seconds=segment_split_seconds)
         )
         .fill_null(False)
         .alias("new_segment_marker")
@@ -349,9 +645,7 @@ def process_flight_data(
         logging.info("使用 'numeric' 策略生成轨迹ID (例如: PlaneA_0)")
         segmented_lf = segmented_lf.with_columns(
             (
-                pl.col("ID").cast(pl.Utf8)
-                + pl.lit("_")
-                + pl.col("segment_id").cast(pl.Utf8)
+                pl.col("ID").cast(pl.Utf8) + pl.col("segment_id").cast(pl.Utf8)
             ).alias("Unique_ID")
         )
     elif unique_id_strategy == "timestamp":
@@ -376,7 +670,7 @@ def process_flight_data(
     logging.info("正在统计过滤和切分后的有效数据点总数...")
     # 注意：这次 collect 会触发完整的计算计划，但只为了获取行数，开销可控
     total_processed_rows = (
-        segmented_lf.select(pl.len()).collect(streaming=True).item()
+        segmented_lf.select(pl.len()).collect(engine="streaming").item()
     )
     logging.info(
         f"经过过滤和轨迹切分后，剩余 {total_processed_rows:,} 个有效数据点。"
@@ -454,6 +748,8 @@ def process_flight_data(
             _process_trajectory_worker_traffic,
             temp_file_path=temp_file,
             min_len_for_clean=min_len_for_clean,
+            min_valid_block_len=min_valid_block_len,
+            resample_freq=resample_freq,
         )
 
         skipped_short_count = 0
@@ -521,12 +817,14 @@ def process_flight_data(
     # 保存用于对比的预处理后文件
     if all_preprocessed_dfs:
         preprocessed_df = pl.concat(all_preprocessed_dfs)
-        preprocessed_df = preprocessed_df.rename({"Unique_ID": "ID"}).select(
-            ["ID", "Time", "Lon", "Lat", "H"]
-        )
-        # 修复：对中间文件也进行时间格式化
         preprocessed_df = preprocessed_df.with_columns(
-            pl.col("Time").dt.strftime("%Y%m%d %H:%M:%S%.3f").alias("Time")
+            Time=pl.col("Time").dt.strftime("%Y%m%d %H:%M:%S%.3f")
+        ).select(
+            pl.col("Unique_ID").alias("id"),
+            pl.col("H").alias("H"),
+            pl.col("Lon").alias("Lon"),
+            pl.col("Lat").alias("Lat"),
+            pl.col("Time").alias("Time"),
         )
         preprocessed_output_path = os.path.join(
             output_dir, f"preprocessed_for_comparison.{output_format}"
@@ -548,25 +846,72 @@ def process_flight_data(
         if final_concat_df.is_empty():
             logging.warning("最终平滑处理后没有可保存的数据。")
         else:
-            final_df = final_concat_df.rename({"Unique_ID": "ID"}).select(
-                ["ID", "Time", "Lon", "Lat", "H"]
-            )
-            final_df = final_df.with_columns(
-                pl.col("Time").dt.strftime("%Y%m%d %H:%M:%S%.3f").alias("Time")
-            )
-            output_filename = f"final_processed_trajectories.{output_format}"
-            output_path = os.path.join(output_dir, output_filename)
-            try:
-                if output_format == "csv":
-                    final_df.write_csv(output_path)
-                elif output_format == "parquet":
-                    final_df.write_parquet(output_path)
+            # --- 第五阶段 (新增): 全局零容忍最终验证 ---
+            # 这是写入文件前的最后一道关卡，确保100%的数据纯净性。
+            logging.info("--- 阶段五: 正在执行全局零容忍最终验证... ---")
 
-                logging.info(
-                    f"成功！已保存 {final_df['ID'].n_unique()} 条最终处理后的轨迹到 {output_path}"
+            # 1. 识别含有null值的轨迹
+            key_cols_final_check = ["Lon", "Lat", "H"]
+
+            # 创建一个布尔列，如果任何关键列为null，则为True
+            is_contaminated_expr = pl.any_horizontal(
+                [pl.col(c).is_null() for c in key_cols_final_check]
+            )
+
+            contaminated_ids_df = (
+                final_concat_df.filter(is_contaminated_expr)
+                .select("Unique_ID")
+                .unique()
+            )
+
+            # 2. 如果存在受污染的轨迹，则记录日志并分离数据
+            if not contaminated_ids_df.is_empty():
+                contaminated_ids = contaminated_ids_df["Unique_ID"].to_list()
+                for traj_id in contaminated_ids:
+                    logging.critical(
+                        f"轨迹ID '{traj_id}' 在完成所有处理步骤后，仍检测到残留的缺失值，已被强制丢弃。"
+                        " 这强烈表明上游处理流程中存在未被覆盖的边缘案例，需要人工介入检查。"
+                    )
+
+                # 从主数据集中移除这些轨迹
+                final_pure_df = final_concat_df.filter(
+                    ~pl.col("Unique_ID").is_in(contaminated_ids)
                 )
-            except Exception as e:
-                logging.error(f"保存最终文件到 {output_path} 时失败: {e}")
+                logging.warning(
+                    f"已强制丢弃 {len(contaminated_ids)} 条在最终验证中失败的轨迹。"
+                )
+            else:
+                final_pure_df = final_concat_df
+                logging.info("所有轨迹均通过最终完整性质检，数据100%纯净。")
+
+            # 3. 只处理和保存纯净的数据
+            if final_pure_df.is_empty():
+                logging.warning("最终验证后，没有剩余的纯净轨迹可供保存。")
+            else:
+                final_df = final_pure_df.with_columns(
+                    Time=pl.col("Time").dt.strftime("%Y%m%d %H:%M:%S%.3f")
+                ).select(
+                    pl.col("Unique_ID").alias("id"),
+                    pl.col("H").alias("H"),
+                    pl.col("Lon").alias("Lon"),
+                    pl.col("Lat").alias("Lat"),
+                    pl.col("Time").alias("Time"),
+                )
+                output_filename = (
+                    f"final_processed_trajectories.{output_format}"
+                )
+                output_path = os.path.join(output_dir, output_filename)
+                try:
+                    if output_format == "csv":
+                        final_df.write_csv(output_path)
+                    elif output_format == "parquet":
+                        final_df.write_parquet(output_path)
+
+                    logging.info(
+                        f"成功！已保存 {final_df['id'].n_unique()} 条通过最终验证的轨迹到 {output_path}"
+                    )
+                except Exception as e:
+                    logging.error(f"保存最终文件到 {output_path} 时失败: {e}")
 
     # 保存错误日志
     if failed_trajectories_log:
@@ -632,10 +977,10 @@ if __name__ == "__main__":
         help="用于并行处理的最大工作进程数",
     )
     parser.add_argument(
-        "--segment_split_minutes",
+        "--segment_split_seconds",
         type=int,
-        default=5,
-        help="用于切分轨迹的时间间隔（分钟）",
+        default=20,
+        help="用于切分轨迹的时间间隔（秒）",
     )
     parser.add_argument(
         "--log_level",
@@ -663,15 +1008,30 @@ if __name__ == "__main__":
         help="如果设置，将在航段切分后保存一个用于调试的CSV文件",
     )
 
+    parser.add_argument(
+        "--min_valid_block_len",
+        type=int,
+        default=3,
+        help="清理轨迹首尾NaN时，所需的最小连续有效数据点数",
+    )
+
     # 地理和高度过滤参数
     parser.add_argument("--h_min", type=float, default=0, help="最低高度 (米)")
     parser.add_argument(
-        "--h_max", type=float, default=20000, help="最高高度 (米)"
+        "--h_max", type=float, default=30000, help="最高高度 (米)"
     )
     parser.add_argument("--lon_min", type=float, default=-180, help="最小经度")
     parser.add_argument("--lon_max", type=float, default=180, help="最大经度")
     parser.add_argument("--lat_min", type=float, default=-90, help="最小纬度")
     parser.add_argument("--lat_max", type=float, default=90, help="最大纬度")
+
+    parser.add_argument(
+        "--resample_freq",
+        type=str,
+        default="1s",
+        choices=["1s", "2s", "5s"],
+        help="重采样的时间频率 (例如: '1s', '2s', '5s')",
+    )
 
     args = parser.parse_args()
 
@@ -693,9 +1053,11 @@ if __name__ == "__main__":
         lat_max=args.lat_max,
         encoding_priority=args.encoding_priority,
         max_workers=args.max_workers,
-        segment_split_minutes=args.segment_split_minutes,
+        segment_split_seconds=args.segment_split_seconds,
         log_level=args.log_level,
         min_len_for_clean=args.min_len_for_clean,
+        min_valid_block_len=args.min_valid_block_len,
         unique_id_strategy=args.unique_id_strategy,
         save_debug_segmented_file=args.save_debug_segmented_file,
+        resample_freq=args.resample_freq,
     )

@@ -2,7 +2,7 @@
 # ==============================================================================
 # ** 高性能飞行数据预处理器 (Polars/Traffic版) **
 #
-# ** 版本: 2.3 (Final with robust error handling) **
+# ** 版本: 2.1 (Final) **
 #
 # ** 依赖项: **
 #   pip install polars numpy tqdm psutil traffic pandas
@@ -12,9 +12,9 @@
 #
 # ** 核心改进点 (与原版对比): **
 #   - 使用 traffic 库替换了自定义的平滑和清理函数。
-#   - 采用多阶段滤波策略（去离群点 -> 预平滑 -> 特征工程 -> 全局平滑）。
+#   - 采用多阶段滤波策略（去离群点 -> 预平滑 -> 特征工程 -> 全局平滑），
+#     以稳健地处理高噪声数据。
 #   - 增加保存预处理中间文件的功能，便于对比分析。
-#   - 实现了健壮的错误捕获和日志记录机制。
 # ==============================================================================
 
 # 1. Imports
@@ -26,6 +26,7 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 from datetime import timedelta
 from functools import partial
+from typing import Optional
 
 import polars as pl
 from tqdm import tqdm
@@ -83,11 +84,10 @@ def dms_to_decimal_expr(dms_col: str) -> pl.Expr:
 
 def _process_trajectory_worker_traffic(
     unique_id: str, temp_file_path: str, min_len_for_clean: int
-) -> dict:
+) -> Optional[tuple[pl.DataFrame, pl.DataFrame]]:
     """
     使用 traffic 库处理单个航段的工作函数。
     遵循“预处理 -> 特征工程 -> 标准化 -> 全局平滑”的四阶段流程。
-    返回一个状态字典。
     """
     try:
         # 从临时文件中读取航段数据
@@ -101,7 +101,7 @@ def _process_trajectory_worker_traffic(
             trajectory_df_polars.is_empty()
             or len(trajectory_df_polars) < min_len_for_clean
         ):
-            return {"status": "skipped", "reason": "too short"}
+            return None
 
         # 转换为 Pandas DataFrame 以便使用 traffic 库
         pandas_df = trajectory_df_polars.to_pandas()
@@ -128,7 +128,7 @@ def _process_trajectory_worker_traffic(
         pre_filter = FilterAboveSigmaMedian() | FilterMedian()
         flight_pre_filtered = flight.filter(pre_filter, strategy=None)
         if flight_pre_filtered is None:
-            return {"status": "skipped", "reason": "empty after pre-filtering"}
+            return None
 
         # --- 第二阶段: 可靠的特征工程 ---
         flight_with_dynamics = flight_pre_filtered.cumulative_distance().rename(
@@ -146,30 +146,18 @@ def _process_trajectory_worker_traffic(
             vertical_rate=vertical_rate
         )
 
-        # --- 第三阶段: 标准化与最终填充 ---
+        # --- 第三阶段: 标准化 ---
         resampled_flight = flight_with_dynamics.resample("1s")
         if resampled_flight is None:
-            return {"status": "skipped", "reason": "empty after resampling"}
-
-        # 强制填充所有可能存在的NaN值，确保进入最终滤波器的数据是完整的
-        filled_data = resampled_flight.data.copy()
-        # 对所有数值类型的列应用三步填充策略
-        numeric_cols = filled_data.select_dtypes(include=np.number).columns
-        filled_data[numeric_cols] = (
-            filled_data[numeric_cols].interpolate().ffill().bfill()
-        )
-        resampled_flight_filled = Flight(filled_data)
+            return None
 
         # --- 第四阶段: 全局最优平滑 ---
         # 卡尔曼滤波器在笛卡尔坐标系下工作，需要先进行坐标转换
-        flight_with_xy = resampled_flight_filled.compute_xy()
+        flight_with_xy = resampled_flight.compute_xy()
         final_smoother = KalmanSmoother6D()
         final_flight = flight_with_xy.filter(final_smoother)
         if final_flight is None:
-            return {
-                "status": "skipped",
-                "reason": "empty after final smoothing",
-            }
+            return None
 
         # 为对比准备预处理后的数据
         preprocessed_df_pandas = flight_pre_filtered.data.rename(
@@ -193,20 +181,17 @@ def _process_trajectory_worker_traffic(
             }
         )
 
-        return {
-            "status": "success",
-            "data": (
-                pl.from_pandas(preprocessed_df_pandas),
-                pl.from_pandas(final_df_pandas),
-            ),
-        }
+        # 以元组形式返回两个DataFrame
+        return (
+            pl.from_pandas(preprocessed_df_pandas),
+            pl.from_pandas(final_df_pandas),
+        )
 
-    except np.linalg.LinAlgError:
-        # 捕获奇异矩阵错误，并作为特定失败原因返回
-        return {"status": "error", "reason": "Singular matrix"}
     except Exception as e:
-        # 捕获所有其他异常
-        return {"status": "error", "reason": str(e)}
+        logging.error(
+            f"使用 traffic 处理航段 {unique_id} 时发生错误: {e}", exc_info=True
+        )
+        return None
 
 
 # 5. Main Processing Function
@@ -422,7 +407,6 @@ def process_flight_data(
     temp_file = os.path.join(output_dir, "_temp_segmented_data.parquet")
     all_preprocessed_dfs = []
     all_final_dfs = []
-    failed_trajectories_log = []
     executor = ProcessPoolExecutor(max_workers=max_workers)
 
     try:
@@ -458,27 +442,15 @@ def process_flight_data(
 
         skipped_short_count = 0
         with tqdm(total=len(unique_ids), desc="并行处理航段") as pbar:
-            for unique_id, result in zip(
-                unique_ids, executor.map(worker_func, unique_ids)
-            ):
-                if result["status"] == "success":
-                    preprocessed_df, final_df = result["data"]
+            for result in executor.map(worker_func, unique_ids):
+                if result is None:
+                    skipped_short_count += 1
+                else:
+                    preprocessed_df, final_df = result
                     if not preprocessed_df.is_empty():
                         all_preprocessed_dfs.append(preprocessed_df)
                     if not final_df.is_empty():
                         all_final_dfs.append(final_df)
-                else:
-                    # 记录失败或跳过的航段信息
-                    original_id = unique_id.split("_")[0]
-                    log_entry = {
-                        "unique_id": unique_id,
-                        "original_id": original_id,
-                        "status": result["status"],
-                        "reason": result["reason"],
-                    }
-                    failed_trajectories_log.append(log_entry)
-                    if result["status"] == "skipped":
-                        skipped_short_count += 1
 
                 pbar.update(1)
 
@@ -500,19 +472,8 @@ def process_flight_data(
             os.remove(temp_file)
             logging.info(f"已清理临时文件: {temp_file}")
 
-    if not all_final_dfs and not all_preprocessed_dfs:
+    if not all_final_dfs:
         logging.warning("所有航段处理后均为空，没有可保存的数据。")
-        # 即使没有成功的数据，也要检查是否有错误日志需要保存
-        if failed_trajectories_log:
-            error_log_df = pl.DataFrame(failed_trajectories_log)
-            error_log_path = os.path.join(output_dir, "error_log.csv")
-            try:
-                error_log_df.write_csv(error_log_path)
-                logging.info(
-                    f"检测到处理失败的航段，详情已记录到: {error_log_path}"
-                )
-            except Exception as e:
-                logging.error(f"保存错误日志文件时失败: {e}")
         return
 
     # --- 阶段四: 保存结果 ---
@@ -523,10 +484,6 @@ def process_flight_data(
         preprocessed_df = pl.concat(all_preprocessed_dfs)
         preprocessed_df = preprocessed_df.rename({"Unique_ID": "ID"}).select(
             ["ID", "Time", "Lon", "Lat", "H"]
-        )
-        # 修复：对中间文件也进行时间格式化
-        preprocessed_df = preprocessed_df.with_columns(
-            pl.col("Time").dt.strftime("%Y%m%d %H:%M:%S%.3f").alias("Time")
         )
         preprocessed_output_path = os.path.join(
             output_dir, f"preprocessed_for_comparison.{output_format}"
@@ -543,42 +500,29 @@ def process_flight_data(
             logging.error(f"保存预处理对比文件时失败: {e}")
 
     # 保存最终平滑后的文件
-    if all_final_dfs:
-        final_concat_df = pl.concat(all_final_dfs)
-        if final_concat_df.is_empty():
-            logging.warning("最终平滑处理后没有可保存的数据。")
-        else:
-            final_df = final_concat_df.rename({"Unique_ID": "ID"}).select(
-                ["ID", "Time", "Lon", "Lat", "H"]
-            )
-            final_df = final_df.with_columns(
-                pl.col("Time").dt.strftime("%Y%m%d %H:%M:%S%.3f").alias("Time")
-            )
-            output_filename = f"final_processed_trajectories.{output_format}"
-            output_path = os.path.join(output_dir, output_filename)
-            try:
-                if output_format == "csv":
-                    final_df.write_csv(output_path)
-                elif output_format == "parquet":
-                    final_df.write_parquet(output_path)
-
-                logging.info(
-                    f"成功！已保存 {final_df['ID'].n_unique()} 条最终处理后的轨迹到 {output_path}"
-                )
-            except Exception as e:
-                logging.error(f"保存最终文件到 {output_path} 时失败: {e}")
-
-    # 保存错误日志
-    if failed_trajectories_log:
-        error_log_df = pl.DataFrame(failed_trajectories_log)
-        error_log_path = os.path.join(output_dir, "error_log.csv")
+    final_concat_df = pl.concat(all_final_dfs)
+    if final_concat_df.is_empty():
+        logging.warning("最终平滑处理后没有可保存的数据。")
+    else:
+        final_df = final_concat_df.rename({"Unique_ID": "ID"}).select(
+            ["ID", "Time", "Lon", "Lat", "H"]
+        )
+        final_df = final_df.with_columns(
+            pl.col("Time").dt.strftime("%Y%m%d %H:%M:%S%.3f").alias("Time")
+        )
+        output_filename = f"final_processed_trajectories.{output_format}"
+        output_path = os.path.join(output_dir, output_filename)
         try:
-            error_log_df.write_csv(error_log_path)
+            if output_format == "csv":
+                final_df.write_csv(output_path)
+            elif output_format == "parquet":
+                final_df.write_parquet(output_path)
+
             logging.info(
-                f"检测到处理失败的航段，详情已记录到: {error_log_path}"
+                f"成功！已保存 {final_df['ID'].n_unique()} 条最终处理后的轨迹到 {output_path}"
             )
         except Exception as e:
-            logging.error(f"保存错误日志文件时失败: {e}")
+            logging.error(f"保存最终文件到 {output_path} 时失败: {e}")
 
     if failed_files:
         logging.warning("以下文件在读取过程中失败，已被跳过:")
