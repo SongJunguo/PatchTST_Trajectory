@@ -4,6 +4,7 @@
 # ** Web可视化模型推理一键运行脚本 **
 #
 # ** 功能: **
+#   - 激活 conda 虚拟环境 torch
 #   - 调用 inference_for_web.py 脚本进行模型推理。
 #   - 提供清晰、可配置的参数化接口。
 #   - 指定要加载的预训练模型ID。
@@ -12,6 +13,47 @@
 # --- 说明 ---
 # 脚本应从项目根目录 (PatchTST/) 运行。
 clear
+
+# --- 激活 conda 虚拟环境 ---
+echo "--- 激活 conda 虚拟环境 torch ---"
+
+# 初始化 conda（如果尚未初始化）
+if [ -f "/opt/miniconda3/etc/profile.d/conda.sh" ]; then
+    source "/opt/miniconda3/etc/profile.d/conda.sh"
+elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+    source "$HOME/miniconda3/etc/profile.d/conda.sh"
+elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+    source "$HOME/anaconda3/etc/profile.d/conda.sh"
+elif [ -f "/opt/conda/etc/profile.d/conda.sh" ]; then
+    source "/opt/conda/etc/profile.d/conda.sh"
+else
+    echo "警告: 未找到 conda 初始化脚本，尝试使用 conda init..."
+    # 尝试运行 conda init
+    if command -v conda &> /dev/null; then
+        eval "$(conda shell.bash hook)"
+    else
+        echo "❌ 无法找到 conda 命令，请检查 conda 安装"
+        exit 1
+    fi
+fi
+
+# 激活 torch 虚拟环境
+conda activate torch
+
+# 检查激活是否成功
+if [ "$CONDA_DEFAULT_ENV" = "torch" ]; then
+    echo "✓ 成功激活 conda 虚拟环境: $CONDA_DEFAULT_ENV"
+else
+    echo "❌ 激活 conda 虚拟环境失败，当前环境: $CONDA_DEFAULT_ENV"
+    echo "请确保已创建名为 'torch' 的 conda 虚拟环境"
+    exit 1
+fi
+
+echo "--- Python 版本信息 ---"
+python --version
+echo "--- PyTorch 版本信息 ---"
+python -c "import torch; print(f'PyTorch版本: {torch.__version__}')" 2>/dev/null || echo "PyTorch 未安装或无法导入"
+echo "------------------------------------"
 
 # --- 可配置参数 ---
 
