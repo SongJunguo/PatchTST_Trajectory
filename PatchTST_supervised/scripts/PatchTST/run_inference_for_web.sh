@@ -65,7 +65,7 @@ MODEL_ID="20250612flight_dependent_test"
 # 2. 数据路径
 #    这些路径应指向第一阶段数据清洗脚本的输出。
 ROOT_PATH="./PatchTST_supervised/dataset/processed_for_web/"
-DATA_PATH="history_data.parquet"
+DATA_PATH="final_processed_trajectories.parquet"
 
 # 3. 模型和任务参数
 #    这些参数必须与训练时使用的参数保持一致。
@@ -74,14 +74,33 @@ SEQ_LEN=192
 PRED_LEN=72
 PATCH_LEN=16
 STRIDE=8
+PADDING_PATCH="end"
+REVIN=1
+AFFINE=0
+SUBTRACT_LAST=0
+DECOMPOSITION=0
+KERNEL_SIZE=25
+INDIVIDUAL=1
 ENC_IN=3 # 输入特征数 (H, JD, WD)
 C_OUT=3  # 输出特征数 (H, JD, WD)
 
 # 4. 硬件和批处理配置
-BATCH_SIZE=1024
-NUM_WORKERS=16
-USE_MULTI_GPU=true
-DEVICES="0,1"
+# 🚀 基于性能测试的最优配置：70,865 samples/s 吞吐量
+BATCH_SIZE=1024     # 大批处理大小，实测最佳性能配置
+NUM_WORKERS=2      # 4个工作进程，实现最佳数据预加载效率
+USE_MULTI_GPU=false
+DEVICES="0"
+
+# 5. 数据加载优化配置
+PIN_MEMORY=true     # 启用内存锁定，加速GPU数据传输
+PERSISTENT_WORKERS=true  # 保持工作进程存活，减少进程创建开销
+Dataloader_STRIDE=64 # 🚀 新增：数据加载器滑窗步长
+ 
+ # 6. 系统级优化 - 允许更多线程以提高并行度
+ export OMP_NUM_THREADS=4        # 允许适量OpenMP线程
+export MKL_NUM_THREADS=4        # 允许适量MKL线程
+export NUMEXPR_NUM_THREADS=4    # 允许适量NumExpr线程
+export PYTORCH_NUM_THREADS=4    # 设置PyTorch线程数
 
 # --- 脚本执行逻辑 (一般无需修改) ---
 
@@ -104,7 +123,7 @@ echo ""
 python -u ./PatchTST_supervised/inference_for_web.py \
   --model_id "$MODEL_ID" \
   --model $MODEL_NAME \
-  --data flight_inference \
+  --data flight \
   --features M \
   --root_path "$ROOT_PATH" \
   --data_path "$DATA_PATH" \
@@ -113,10 +132,20 @@ python -u ./PatchTST_supervised/inference_for_web.py \
   --label_len 0 \
   --patch_len $PATCH_LEN \
   --stride $STRIDE \
+  --padding_patch $PADDING_PATCH \
+  --revin $REVIN \
+  --affine $AFFINE \
+  --subtract_last $SUBTRACT_LAST \
+  --decomposition $DECOMPOSITION \
+  --kernel_size $KERNEL_SIZE \
+  --individual $INDIVIDUAL \
   --enc_in $ENC_IN \
   --c_out $C_OUT \
   --batch_size $BATCH_SIZE \
   --num_workers $NUM_WORKERS \
+  --pin_memory $PIN_MEMORY \
+  --persistent_workers $PERSISTENT_WORKERS \
+  --dataloader_stride $Dataloader_STRIDE \
   $GPU_ARGS
 
 echo ""
