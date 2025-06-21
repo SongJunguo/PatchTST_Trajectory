@@ -46,7 +46,8 @@ class Exp_Inference(Exp_Main):
                 scale=True, # 推理时需要与训练时一致的归一化
                 timeenc=self.args.embed_type,
                 freq=self.args.freq,
-                stride=self.args.dataloader_stride # 🚀 传递滑窗步长
+                stride=self.args.dataloader_stride, # 🚀 传递滑窗步长
+                stats_path=self.args.stats_path # 传递归一化统计文件路径
             )
             # 解析字符串参数为布尔值
             pin_memory = self.args.pin_memory.lower() == 'true'
@@ -276,6 +277,8 @@ if __name__ == '__main__':
     parser.add_argument('--des', type=str, default='Exp', help='exp description')
     # 🚀 新增：数据加载器滑窗步长参数
     parser.add_argument('--dataloader_stride', type=int, default=1, help='stride for dataloader sliding window')
+    # 🚀 新增：归一化统计文件路径
+    parser.add_argument('--stats_path', type=str, required=True, help='path to the normalization stats file')
 
     args = parser.parse_args()
 

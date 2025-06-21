@@ -93,8 +93,16 @@ def _process_trajectory_worker_traffic(
     max_displacement_degrees: float,
     anomaly_max_duration: int,
     anomaly_max_rate: float,
+    max_latlon_speed: float,
+    max_alt_speed: float,
     log_level: str,
     output_dir: str,
+    h_min: float,
+    h_max: float,
+    lon_min: float,
+    lon_max: float,
+    lat_min: float,
+    lat_max: float,
 ) -> dict:
     """
     使用 traffic 库处理单个航段的工作函数。
@@ -116,33 +124,10 @@ def _process_trajectory_worker_traffic(
             .collect()
         )
 
-        # --- (新增) 基于 PLANETYPE 的有效性检查 ---
-        # 理由: 根据机型信息清理无效的航迹数据点。
-        if "PLANETYPE" in trajectory_df_polars.columns:
-            total_rows = trajectory_df_polars.height
-            if total_rows > 0:
-                null_planetype_rows = trajectory_df_polars.filter(
-                    pl.col("PLANETYPE").is_null()
-                ).height
-
-                # 如果 PLANETYPE 存在部分空值，则只保留非空的行
-                # 如果 PLANETYPE 全部为空或全部有值，则不进行任何操作，保留原始数据进行后续处理
-                if 0 < null_planetype_rows < total_rows:
-                    logging.info(
-                        f"轨迹ID '{unique_id}' 检测到 {null_planetype_rows} 行 PLANETYPE 为空，将予以移除。"
-                    )
-                    trajectory_df_polars = trajectory_df_polars.filter(
-                        pl.col("PLANETYPE").is_not_null()
-                    )
-
-            # 清理操作完成后，删除 PLANETYPE 列，后续不再需要
-            trajectory_df_polars = trajectory_df_polars.drop("PLANETYPE")
-        # --- 检查结束 ---
-
         if trajectory_df_polars.is_empty():
             return {
                 "status": "skipped",
-                "reason": "empty after PLANETYPE filtering or before processing",
+                "reason": "empty before processing",
             }
 
         # 转换为 Pandas DataFrame 以便使用 traffic 库
@@ -351,6 +336,92 @@ def _process_trajectory_worker_traffic(
             # **不执行任何操作，resampled_flight 保持原样**
         # ==================== 新增逻辑结束 ====================
 
+        # ==================== 新增：基于速度的异常段检测与切分 ====================
+        # 根据用户需求，在高度异常清理后，进行速度合规性检查。
+        # 核心逻辑：识别速度超限的连续数据段，丢弃它们，并将剩余的正常数据段切分为新的独立轨迹。
+        df_for_speed_check = resampled_flight.data.copy()
+        original_flight_id = df_for_speed_check["flight_id"].iloc[0]
+
+        # 步骤 1: 计算速度 (注意单位：高度为英尺)
+        time_diff = df_for_speed_check["timestamp"].diff().dt.total_seconds()
+        # 避免除以零
+        time_diff_safe = time_diff.replace(0, np.nan)
+
+        lon_speed = (
+            df_for_speed_check["longitude"].diff().abs() / time_diff_safe
+        )
+        lat_speed = (
+            df_for_speed_check["latitude"].diff().abs() / time_diff_safe
+        )
+        # 将用户输入的 m/s 阈值转换为 ft/s
+        alt_speed_threshold_fts = max_alt_speed * 3.28084
+        alt_speed = (
+            df_for_speed_check["altitude"].diff().abs() / time_diff_safe
+        )
+
+        # 步骤 2: 标记每个点是否超速
+        df_for_speed_check["is_abnormal"] = (
+            (lon_speed > max_latlon_speed)
+            | (lat_speed > max_latlon_speed)
+            | (alt_speed > alt_speed_threshold_fts)
+        ).fillna(False)  # 第一个点为NaN，填充为False
+
+        # 步骤 3: 如果检测到异常，则执行切分和丢弃
+        if df_for_speed_check["is_abnormal"].any():
+            logging.info(
+                f"轨迹ID '{original_flight_id}' 检测到速度超限段，将执行丢弃和切分..."
+            )
+
+            # 步骤 3.1: 识别连续的正常/异常段落
+            state_change = df_for_speed_check["is_abnormal"].ne(
+                df_for_speed_check["is_abnormal"].shift()
+            )
+            df_for_speed_check["block_id"] = state_change.cumsum()
+
+            # 步骤 3.2: 丢弃所有异常段
+            df_cleaned = df_for_speed_check[
+                ~df_for_speed_check["is_abnormal"]
+            ].copy()
+
+            if df_cleaned.is_empty():
+                return {
+                    "status": "skipped",
+                    "reason": "empty after velocity anomaly removal",
+                }
+
+            # 步骤 3.3: 为幸存的正常段生成新的唯一ID
+            # 使用 groupby(..., group_keys=False) 来避免未来的警告
+            df_cleaned["flight_id"] = df_cleaned.groupby(
+                "block_id", group_keys=False
+            ).ngroup()
+            df_cleaned["flight_id"] = (
+                f"{original_flight_id}_v"
+                + df_cleaned["flight_id"].astype(str)
+            )
+
+            # 步骤 3.4: 丢弃长度过短的新航段
+            # 注意：这里需要重新计算每个新ID的长度
+            id_counts = df_cleaned["flight_id"].value_counts()
+            valid_ids = id_counts[id_counts >= min_len_for_clean].index
+            
+            if len(valid_ids) == 0:
+                return {
+                    "status": "skipped",
+                    "reason": f"all segments shorter than {min_len_for_clean} after velocity split",
+                }
+
+            df_final_split = df_cleaned[
+                df_cleaned["flight_id"].isin(valid_ids)
+            ].copy()
+            
+            logging.info(
+                f"轨迹ID '{original_flight_id}' 被切分为 {len(valid_ids)} 个新的有效航段。"
+            )
+
+            # 用处理后的数据更新 resampled_flight
+            resampled_flight = Flight(df_final_split)
+        # ==================== 速度限制逻辑结束 ====================
+
         # --- (新增) 健壮性检查: 验证重采样和插值后是否存在NaN ---
         # 理由: 确保 traffic 的 resample/interpolate 行为符合预期，没有留下任何NaN。
         # 这有助于在早期阶段发现数据问题，而不是等到最终的卡尔曼滤波器步骤。
@@ -441,6 +512,13 @@ def _process_trajectory_worker_traffic(
                 "reason": "empty after final smoothing",
             }
 
+        # 新增：根据用户要求，在最终平滑后再次进行长度检查
+        if len(final_flight.data) < min_len_for_clean:
+            return {
+                "status": "skipped",
+                "reason": f"too short after final smoothing (len={len(final_flight.data)} < {min_len_for_clean})",
+            }
+
         # --- 第五阶段: 单位转换与输出准备 ---
         # 在保存前，将高度从英尺转换回米，以保持与输入数据的一致性
         final_flight_meters = final_flight.assign(
@@ -488,6 +566,22 @@ def _process_trajectory_worker_traffic(
                 "reason": "Post-smoothing NaN check failed inside worker",
             }
 
+        # --- 第七阶段 (新增): Worker内部的最终范围验证 ---
+        # 在将数据返回给主进程前，进行最后一次地理和高度范围检查。
+        # 这是根据用户要求，在每个worker内部完成的最终验证。
+        if not (
+            final_df_pandas["Lon"].between(lon_min, lon_max).all()
+            and final_df_pandas["Lat"].between(lat_min, lat_max).all()
+            and final_df_pandas["H"].between(h_min, h_max).all()
+        ):
+            logging.warning(
+                f"轨迹ID '{unique_id}' 在最终平滑后，有数据点超出了预设的地理或高度范围，将被丢弃。"
+            )
+            return {
+                "status": "skipped",
+                "reason": "Post-smoothing out-of-bounds check failed inside worker",
+            }
+
         return {
             "status": "success",
             "data": (
@@ -527,6 +621,8 @@ def process_flight_data(
     max_displacement_degrees: float = 2.0,
     anomaly_max_duration: int = 20,
     anomaly_max_rate: float = 100.0,
+    max_latlon_speed: float = 0.01,
+    max_alt_speed: float = 100.0,
 ):
     """
     主处理流程函数，包含了计划书中定义的四个阶段。
@@ -596,6 +692,38 @@ def process_flight_data(
     # 合并所有LazyFrames
     lazy_df = pl.concat(lazy_frames)
 
+    # 新增：根据PLANETYPE筛选包含'歼'的行并随后删除该列
+    logging.info("--- 新增筛选: 正在根据 PLANETYPE 列筛选含'歼'的机型... ---")
+    try:
+        # 为了日志记录，我们需要在这里触发一次计算来获取行数
+        # 这会扫描数据，但对于监控数据处理流程是必要的
+        # 使用 streaming 引擎来降低内存压力
+        original_count = lazy_df.select(pl.len()).collect(engine="streaming").item()
+
+        # 应用过滤器，只保留 PLANETYPE 列中包含 "歼" 的行
+        lazy_df = lazy_df.filter(pl.col("PLANETYPE").str.contains("歼", literal=True))
+
+        # 获取筛选后的行数
+        filtered_count = lazy_df.select(pl.len()).collect(engine="streaming").item()
+        
+        dropped_count = original_count - filtered_count
+        if original_count > 0:
+            loss_rate = (dropped_count / original_count) * 100
+            logging.info(f"  - PLANETYPE筛选前数据点: {original_count:,}")
+            logging.info(f"  - 筛选后剩余: {filtered_count:,}")
+            logging.info(f"  - 因PLANETYPE不含'歼'字丢弃: {dropped_count:,} ({loss_rate:.2f}%)")
+        else:
+            logging.info("  - PLANETYPE筛选前无数据，跳过统计。")
+        
+        # 筛选完成后，删除 PLANETYPE 列
+        lazy_df = lazy_df.drop("PLANETYPE")
+        logging.info("已成功删除 'PLANETYPE' 列。")
+
+    except Exception as e:
+        logging.error(f"在PLANETYPE筛选过程中发生错误: {e}", exc_info=True)
+        logging.warning("由于PLANETYPE筛选时发生错误，将跳过此筛选步骤。")
+    # --- 筛选结束 ---
+
     if log_level.upper() == "DEBUG":
         # --- DEBUG: 检查高度列的类型转换问题 ---
         logging.info(
@@ -653,7 +781,7 @@ def process_flight_data(
             dms_to_decimal_expr("WD").alias("Lat"),
             pl.col("P1").alias("ID"),
         ]
-    ).select(["ID", "Time", "Lon", "Lat", "H", "PLANETYPE"])
+    ).select(["ID", "Time", "Lon", "Lat", "H"])
 
     if log_level.upper() == "DEBUG":
         logging.info("--- [DEBUG]  核心转换后，清理null值前的数据状态 ---")
@@ -816,7 +944,7 @@ def process_flight_data(
         logging.info("正在将分段数据写入临时文件以便并行读取...")
         # 在写入临时文件前，只选择后续处理需要的列
         final_segmented_lf = segmented_lf.select(
-            "Unique_ID", "Time", "Lon", "Lat", "H", "PLANETYPE"
+            "Unique_ID", "Time", "Lon", "Lat", "H"
         )
         final_segmented_lf.sink_parquet(temp_file, compression="zstd")
 
@@ -846,8 +974,16 @@ def process_flight_data(
             max_displacement_degrees=max_displacement_degrees,
             anomaly_max_duration=anomaly_max_duration,
             anomaly_max_rate=anomaly_max_rate,
+            max_latlon_speed=max_latlon_speed,
+            max_alt_speed=max_alt_speed,
             log_level=log_level,
             output_dir=output_dir,
+            h_min=h_min,
+            h_max=h_max,
+            lon_min=lon_min,
+            lon_max=lon_max,
+            lat_min=lat_min,
+            lat_max=lat_max,
         )
 
         skipped_short_count = 0
@@ -1152,6 +1288,20 @@ if __name__ == "__main__":
         help="高度异常检测的最大变化率（米/秒）。",
     )
 
+    # 新增：速度限制参数
+    parser.add_argument(
+        "--max_latlon_speed",
+        type=float,
+        default=0.01,
+        help="用于切分轨迹的最大水平速度（度/秒）。",
+    )
+    parser.add_argument(
+        "--max_alt_speed",
+        type=float,
+        default=100.0,
+        help="用于切分轨迹的最大垂直速度（米/秒）。",
+    )
+
     args = parser.parse_args()
 
     # 创建输出目录
@@ -1182,4 +1332,6 @@ if __name__ == "__main__":
         max_displacement_degrees=args.max_displacement_degrees,
         anomaly_max_duration=args.anomaly_max_duration,
         anomaly_max_rate=args.anomaly_max_rate,
+        max_latlon_speed=args.max_latlon_speed,
+        max_alt_speed=args.max_alt_speed,
     )

@@ -24,7 +24,7 @@ warnings.filterwarnings('ignore')
 
 class Dataset_Flight_Inference(Dataset):
     def __init__(self, root_path, data_path='history_data.parquet', size=None,
-                 features='M', target='H', scale=True, timeenc=1, freq='s', stride=1):
+                 features='M', target='H', scale=True, timeenc=1, freq='s', stride=1, stats_path=None):
         """
         Args:
             root_path (str): 数据文件所在的根目录。
@@ -36,6 +36,7 @@ class Dataset_Flight_Inference(Dataset):
             timeenc (int): 时间编码方式 (0 for simple, 1 for detailed features)。
             freq (str): 时间特征编码的频率。
             stride (int): 数据加载器的滑窗步长。
+            stats_path (str): 归一化统计文件的路径。
         """
         # 1. 初始化基本参数
         if size is None:
@@ -53,6 +54,7 @@ class Dataset_Flight_Inference(Dataset):
         self.timeenc = timeenc
         self.freq = freq
         self.stride = stride # 🚀 保存步长
+        self.stats_path = stats_path # 保存统计文件路径
 
         self.root_path = root_path
         self.data_path = data_path
@@ -82,12 +84,37 @@ class Dataset_Flight_Inference(Dataset):
         else: # MS
             cols_data = feature_cols
 
-        df_data = df_full[cols_data]
+        df_data = df_full[cols_data].copy()
         
         # --- 标准化（优化：使用float32减少内存使用） ---
         self.scaler = StandardScaler()
         if self.scale:
-            self.scaler.fit(df_data.values.astype(np.float32))
+            if not (self.stats_path and os.path.exists(self.stats_path)):
+                raise FileNotFoundError(f"归一化统计文件未找到或未提供路径: {self.stats_path}")
+
+            # 1. 加载训练时的统计数据
+            stats_df = pd.read_csv(self.stats_path)
+            stats_features = list(stats_df['feature'])
+            print(f"从统计文件加载的特征顺序: {stats_features}")
+            print(f"从数据文件加载的特征顺序: {list(df_data.columns)}")
+
+            # 2. 检查特征数量是否匹配
+            if len(df_data.columns) != len(stats_features):
+                raise ValueError(f"数据文件和统计文件的特征数量不匹配! 数据列: {len(df_data.columns)}, 统计文件列: {len(stats_features)}")
+
+            # 3. 启发式重命名：假设顺序一致，将数据列重命名为统计文件中的列名
+            column_mapping = dict(zip(df_data.columns, stats_features))
+            df_data.rename(columns=column_mapping, inplace=True)
+            print(f"应用列名映射: {column_mapping}")
+
+            # 4. 确保最终的列顺序与统计文件严格一致
+            df_data = df_data[stats_features]
+
+            # 5. 设置scaler并转换数据
+            self.scaler.mean_ = stats_df['mean'].values
+            self.scaler.scale_ = stats_df['std'].values
+            print(f"成功从 {self.stats_path} 加载并应用归一化统计信息。")
+            
             data = self.scaler.transform(df_data.values.astype(np.float32))
         else:
             data = df_data.values.astype(np.float32)

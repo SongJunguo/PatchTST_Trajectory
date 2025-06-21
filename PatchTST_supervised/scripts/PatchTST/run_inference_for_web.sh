@@ -83,20 +83,26 @@ KERNEL_SIZE=25
 INDIVIDUAL=1
 ENC_IN=3 # 输入特征数 (H, JD, WD)
 C_OUT=3  # 输出特征数 (H, JD, WD)
+FREQ='h' # 时间特征编码频率，必须与训练时一致
+EMBED_TYPE=0 # 时间嵌入类型，必须与训练时一致
 
-# 4. 硬件和批处理配置
+# 4. 归一化配置
+#    **重要**: 必须指向训练时生成的归一化统计文件。
+STATS_PATH="./PatchTST_supervised/dataset/normalization_stats/processed_trajectories_multi_normalization_stats.csv"
+
+# 5. 硬件和批处理配置
 # 🚀 基于性能测试的最优配置：70,865 samples/s 吞吐量
 BATCH_SIZE=1024     # 大批处理大小，实测最佳性能配置
 NUM_WORKERS=2      # 4个工作进程，实现最佳数据预加载效率
 USE_MULTI_GPU=false
 DEVICES="0"
 
-# 5. 数据加载优化配置
+# 6. 数据加载优化配置
 PIN_MEMORY=true     # 启用内存锁定，加速GPU数据传输
 PERSISTENT_WORKERS=true  # 保持工作进程存活，减少进程创建开销
 Dataloader_STRIDE=64 # 🚀 新增：数据加载器滑窗步长
  
- # 6. 系统级优化 - 允许更多线程以提高并行度
+ # 7. 系统级优化 - 允许更多线程以提高并行度
  export OMP_NUM_THREADS=4        # 允许适量OpenMP线程
 export MKL_NUM_THREADS=4        # 允许适量MKL线程
 export NUMEXPR_NUM_THREADS=4    # 允许适量NumExpr线程
@@ -141,6 +147,9 @@ python -u ./PatchTST_supervised/inference_for_web.py \
   --individual $INDIVIDUAL \
   --enc_in $ENC_IN \
   --c_out $C_OUT \
+  --freq "$FREQ" \
+  --embed_type $EMBED_TYPE \
+  --stats_path "$STATS_PATH" \
   --batch_size $BATCH_SIZE \
   --num_workers $NUM_WORKERS \
   --pin_memory $PIN_MEMORY \
