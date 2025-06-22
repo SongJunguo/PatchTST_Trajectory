@@ -37,13 +37,51 @@ ENCODING_PRIORITY="gbk"
 #    如果两个连续点的时间差超过此值，则切分为新航段。
 SEGMENT_SPLIT_SECONDS=300
 
-# 6. 重采样频率
-#    这是生成均匀时间序列的关键。'1s'代表1秒, '5s'代表5秒。
-RESAMPLE_FREQ="1s"
-
-# 7. 日志级别
+# 6. 日志级别
 #    可选项: 'DEBUG', 'INFO', 'WARNING', 'ERROR'
 LOG_LEVEL="INFO"
+
+# 7. 清洗航段的最小长度
+#    航段的数据点数量必须大于此值，才会被处理。
+MIN_LEN_FOR_CLEAN=20
+
+# 8. 地理和高度范围过滤参数
+H_MIN=100
+H_MAX=30000
+LON_MIN=-180
+LON_MAX=180
+LAT_MIN=-90
+LAT_MAX=90
+
+# 9. 新增功能开关
+#    ID生成策略。可选项: 'numeric' 或 'timestamp'
+UNIQUE_ID_STRATEGY="timestamp"
+#    保存调试文件。可选项: "true" 或 "false"
+SAVE_DEBUG_FILE="true"
+
+# 10. 重采样频率
+#    可选项: '1s', '2s', '5s'
+RESAMPLE_FREQ="1s"
+
+# 11. 过境航班过滤阈值 (度)
+#    如果航迹的经度或纬度总位移超过此值，则被视为过境航班并被丢弃。
+MAX_DISPLACEMENT_DEGREES=2.0
+
+# 12. 高度异常检测参数
+#    设置异常检测时允许的最大持续步数。
+ANOMALY_MAX_DURATION=20
+#    设置异常检测时允许的最大变化率（米/秒）。
+ANOMALY_MAX_RATE=100
+
+# 13. 速度异常检测参数 (新增)
+#    用于切分轨迹的最大水平速度（度/秒）。
+MAX_LATLON_SPEED=0.01
+#    用于切分轨迹的最大垂直速度（米/秒）。
+MAX_ALT_SPEED=100.0
+
+# 14. 其他核心参数 (新增)
+#    清理轨迹首尾NaN时，所需的最小连续有效数据点数
+MIN_VALID_BLOCK_LEN=3
 
 
 # --- 脚本执行逻辑 (一般无需修改) ---
@@ -57,17 +95,33 @@ fi
 # 创建输出目录
 mkdir -p $OUTPUT_DIR
 
-# 使用数组构建参数，以便更健壮地处理
+# 使用数组构建参数，以便更健壮地处理可选参数
 CMD_ARGS=(
     --input_dir "$INPUT_DIR"
     --output_dir "$OUTPUT_DIR"
     --max_workers "$MAX_WORKERS"
     --output_format "$OUTPUT_FORMAT"
     --encoding_priority "$ENCODING_PRIORITY"
+    --h_min "$H_MIN" --h_max "$H_MAX"
+    --lon_min "$LON_MIN" --lon_max "$LON_MAX"
+    --lat_min "$LAT_MIN" --lat_max "$LAT_MAX"
     --segment_split_seconds "$SEGMENT_SPLIT_SECONDS"
-    --resample_freq "$RESAMPLE_FREQ"
     --log_level "$LOG_LEVEL"
+    --min_len_for_clean "$MIN_LEN_FOR_CLEAN"
+    --unique_id_strategy "$UNIQUE_ID_STRATEGY"
+    --resample_freq "$RESAMPLE_FREQ"
+    --max_displacement_degrees "$MAX_DISPLACEMENT_DEGREES"
+    --anomaly_max_duration "$ANOMALY_MAX_DURATION"
+    --anomaly_max_rate "$ANOMALY_MAX_RATE"
+    --min_valid_block_len "$MIN_VALID_BLOCK_LEN"
+    --max_latlon_speed "$MAX_LATLON_SPEED"
+    --max_alt_speed "$MAX_ALT_SPEED"
 )
+
+# 如果 SAVE_DEBUG_FILE 设置为 "true"，则添加调试标志
+if [ "$SAVE_DEBUG_FILE" = "true" ]; then
+    CMD_ARGS+=(--save_debug_segmented_file)
+fi
 
 # 打印将要执行的命令，方便调试
 echo ""

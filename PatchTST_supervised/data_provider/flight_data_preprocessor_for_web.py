@@ -1140,6 +1140,7 @@ def process_flight_data(
                     pl.col("H"),
                     pl.col("Lon").alias("JD"),
                     pl.col("Lat").alias("WD"),
+                    pl.col("track").alias("Heading"),
                     "TASK",
                     "PLANETYPE",
                     pl.col("Time"),
