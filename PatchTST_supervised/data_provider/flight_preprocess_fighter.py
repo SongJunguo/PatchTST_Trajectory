@@ -124,33 +124,10 @@ def _process_trajectory_worker_traffic(
             .collect()
         )
 
-        # --- (新增) 基于 PLANETYPE 的有效性检查 ---
-        # 理由: 根据机型信息清理无效的航迹数据点。
-        if "PLANETYPE" in trajectory_df_polars.columns:
-            total_rows = trajectory_df_polars.height
-            if total_rows > 0:
-                null_planetype_rows = trajectory_df_polars.filter(
-                    pl.col("PLANETYPE").is_null()
-                ).height
-
-                # 如果 PLANETYPE 存在部分空值，则只保留非空的行
-                # 如果 PLANETYPE 全部为空或全部有值，则不进行任何操作，保留原始数据进行后续处理
-                if 0 < null_planetype_rows < total_rows:
-                    logging.info(
-                        f"轨迹ID '{unique_id}' 检测到 {null_planetype_rows} 行 PLANETYPE 为空，将予以移除。"
-                    )
-                    trajectory_df_polars = trajectory_df_polars.filter(
-                        pl.col("PLANETYPE").is_not_null()
-                    )
-
-            # 清理操作完成后，删除 PLANETYPE 列，后续不再需要
-            trajectory_df_polars = trajectory_df_polars.drop("PLANETYPE")
-        # --- 检查结束 ---
-
         if trajectory_df_polars.is_empty():
             return {
                 "status": "skipped",
-                "reason": "empty after PLANETYPE filtering or before processing",
+                "reason": "empty before processing",
             }
 
         # 转换为 Pandas DataFrame 以便使用 traffic 库
@@ -715,6 +692,38 @@ def process_flight_data(
     # 合并所有LazyFrames
     lazy_df = pl.concat(lazy_frames)
 
+    # 新增：根据PLANETYPE筛选包含'歼'的行并随后删除该列
+    logging.info("--- 新增筛选: 正在根据 PLANETYPE 列筛选含'歼'的机型... ---")
+    try:
+        # 为了日志记录，我们需要在这里触发一次计算来获取行数
+        # 这会扫描数据，但对于监控数据处理流程是必要的
+        # 使用 streaming 引擎来降低内存压力
+        original_count = lazy_df.select(pl.len()).collect(engine="streaming").item()
+
+        # 应用过滤器，只保留 PLANETYPE 列中包含 "歼" 的行
+        lazy_df = lazy_df.filter(pl.col("PLANETYPE").str.contains("歼", literal=True))
+
+        # 获取筛选后的行数
+        filtered_count = lazy_df.select(pl.len()).collect(engine="streaming").item()
+        
+        dropped_count = original_count - filtered_count
+        if original_count > 0:
+            loss_rate = (dropped_count / original_count) * 100
+            logging.info(f"  - PLANETYPE筛选前数据点: {original_count:,}")
+            logging.info(f"  - 筛选后剩余: {filtered_count:,}")
+            logging.info(f"  - 因PLANETYPE不含'歼'字丢弃: {dropped_count:,} ({loss_rate:.2f}%)")
+        else:
+            logging.info("  - PLANETYPE筛选前无数据，跳过统计。")
+        
+        # 筛选完成后，删除 PLANETYPE 列
+        lazy_df = lazy_df.drop("PLANETYPE")
+        logging.info("已成功删除 'PLANETYPE' 列。")
+
+    except Exception as e:
+        logging.error(f"在PLANETYPE筛选过程中发生错误: {e}", exc_info=True)
+        logging.warning("由于PLANETYPE筛选时发生错误，将跳过此筛选步骤。")
+    # --- 筛选结束 ---
+
     if log_level.upper() == "DEBUG":
         # --- DEBUG: 检查高度列的类型转换问题 ---
         logging.info(
@@ -772,7 +781,7 @@ def process_flight_data(
             dms_to_decimal_expr("WD").alias("Lat"),
             pl.col("P1").alias("ID"),
         ]
-    ).select(["ID", "Time", "Lon", "Lat", "H", "PLANETYPE"])
+    ).select(["ID", "Time", "Lon", "Lat", "H"])
 
     if log_level.upper() == "DEBUG":
         logging.info("--- [DEBUG]  核心转换后，清理null值前的数据状态 ---")
@@ -935,7 +944,7 @@ def process_flight_data(
         logging.info("正在将分段数据写入临时文件以便并行读取...")
         # 在写入临时文件前，只选择后续处理需要的列
         final_segmented_lf = segmented_lf.select(
-            "Unique_ID", "Time", "Lon", "Lat", "H", "PLANETYPE"
+            "Unique_ID", "Time", "Lon", "Lat", "H"
         )
         final_segmented_lf.sink_parquet(temp_file, compression="zstd")
 
