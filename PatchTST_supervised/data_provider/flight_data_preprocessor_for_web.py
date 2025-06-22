@@ -131,27 +131,18 @@ def _process_trajectory_worker_traffic(
         # 理由: 根据需求，删除每个轨迹的初始部分数据点，因为它们可能不稳定。
         if len(trajectory_df_polars) > 20:
             trajectory_df_polars = trajectory_df_polars.slice(20)
-        # --- (新增) 元数据填充逻辑 ---
-        # 理由: 根据需求，对每个航段的元数据进行规整。
+        # --- (新增) 高效元数据提取 ---
+        # 理由: 根据业务逻辑，每个航段的元数据是固定的。
+        #       我们只需提取单个代表值，避免昂贵的 mode() 和 fill() 计算。
+        meta_cols_to_extract = ["PARTNO", "P1", "GP", "TASK", "PLANETYPE"]
+        meta_dict = {"Unique_ID": unique_id} # 必须包含Unique_ID用于后续关联
+
         if not trajectory_df_polars.is_empty():
-            # 众数填充
-            p1_mode = trajectory_df_polars["P1"].mode()[0] if not trajectory_df_polars["P1"].is_empty() else None
-            task_mode = trajectory_df_polars["TASK"].mode()[0] if "TASK" in trajectory_df_polars.columns and not trajectory_df_polars["TASK"].is_empty() else None
-            planetype_mode = trajectory_df_polars["PLANETYPE"].mode()[0] if "PLANETYPE" in trajectory_df_polars.columns and not trajectory_df_polars["PLANETYPE"].is_empty() else None
-
-            # 前后填充
-            trajectory_df_polars = trajectory_df_polars.with_columns(
-                pl.col("GP").forward_fill().backward_fill()
-            )
-
-            # 应用众数
-            if p1_mode is not None:
-                trajectory_df_polars = trajectory_df_polars.with_columns(pl.lit(p1_mode).alias("P1"))
-            if task_mode is not None:
-                trajectory_df_polars = trajectory_df_polars.with_columns(pl.lit(task_mode).alias("TASK"))
-            if planetype_mode is not None:
-                trajectory_df_polars = trajectory_df_polars.with_columns(pl.lit(planetype_mode).alias("PLANETYPE"))
-        # --- 填充结束 ---
+            for col in meta_cols_to_extract:
+                # .first() 默认跳过null，所以 drop_nulls() 不是必须的，但可以使意图更清晰
+                first_valid_value = trajectory_df_polars.select(pl.col(col).drop_nulls().first()).item()
+                meta_dict[col] = first_valid_value
+        # --- 提取结束 ---
 
         if trajectory_df_polars.is_empty():
             return {
@@ -619,12 +610,9 @@ def _process_trajectory_worker_traffic(
         return {
             "status": "success",
             "data": (
-                pl.from_pandas(preprocessed_df_pandas).with_columns(
-                    [pl.lit(meta_df[col][0], dtype=pl.Utf8).alias(col) for col in meta_cols]
-                ),
-                pl.from_pandas(final_df_pandas).with_columns(
-                    [pl.lit(meta_df[col][0], dtype=pl.Utf8).alias(col) for col in meta_cols]
-                ),
+                pl.from_pandas(preprocessed_df_pandas),
+                pl.from_pandas(final_df_pandas),
+                meta_dict, # 新增返回项
             ),
         }
 
@@ -940,6 +928,7 @@ def process_flight_data(
     temp_file = os.path.join(output_dir, "_temp_segmented_data.parquet")
     all_preprocessed_dfs = []
     all_final_dfs = []
+    all_metadata_rows = [] # 新增列表
     failed_trajectories_log = []
     executor = ProcessPoolExecutor(max_workers=max_workers)
 
@@ -995,11 +984,15 @@ def process_flight_data(
                 unique_ids, executor.map(worker_func, unique_ids)
             ):
                 if result["status"] == "success":
-                    preprocessed_df, final_df = result["data"]
+                    preprocessed_df, final_df, meta_dict = result["data"]
+                    
+                    # 为后续 join 添加关联键
                     if not preprocessed_df.is_empty():
-                        all_preprocessed_dfs.append(preprocessed_df)
+                        all_preprocessed_dfs.append(preprocessed_df.with_columns(pl.lit(meta_dict["Unique_ID"]).alias("Unique_ID")))
                     if not final_df.is_empty():
-                        all_final_dfs.append(final_df)
+                        all_final_dfs.append(final_df.with_columns(pl.lit(meta_dict["Unique_ID"]).alias("Unique_ID")))
+                    
+                    all_metadata_rows.append(meta_dict) # 收集元数据
                 else:
                     # 记录失败或跳过的航段信息
                     original_id = unique_id.split("_")[0]
@@ -1051,31 +1044,42 @@ def process_flight_data(
     # --- 阶段四: 保存结果 ---
     logging.info("--- 阶段四: 正在保存最终结果... ---")
 
+    if not all_metadata_rows:
+        logging.warning("没有收集到任何元数据，无法继续处理。")
+        return
+
+    metadata_df = pl.DataFrame(all_metadata_rows)
+
     # 保存用于对比的预处理后文件
     if all_preprocessed_dfs:
-        preprocessed_df = pl.concat(all_preprocessed_dfs)
-        preprocessed_df = preprocessed_df.with_columns(
+        preprocessed_concat_df = pl.concat(all_preprocessed_dfs)
+        
+        # 使用 join 合并元数据
+        preprocessed_full_df = preprocessed_concat_df.join(metadata_df, on="Unique_ID", how="left")
+        
+        # 在全局数据上执行一次填充
+        preprocessed_full_df = preprocessed_full_df.with_columns(
+            pl.col("GP").forward_fill().backward_fill().over("P1") # 按P1填充保证正确性
+        )
+
+        # 格式化并选择最终列
+        preprocessed_df_to_save = preprocessed_full_df.with_columns(
             Time=pl.col("Time").dt.strftime("%Y%m%d %H:%M:%S%.3f")
         ).select(
             pl.col("Unique_ID").alias("ID"),
-            "PARTNO",
-            "P1",
-            "GP",
-            pl.col("H"),
+            "PARTNO", "P1", "GP", "H",
             pl.col("Lon").alias("JD"),
             pl.col("Lat").alias("WD"),
-            "TASK",
-            "PLANETYPE",
-            pl.col("Time"),
+            "TASK", "PLANETYPE", "Time",
         )
         preprocessed_output_path = os.path.join(
             output_dir, f"preprocessed_for_comparison.{output_format}"
         )
         try:
             if output_format == "csv":
-                preprocessed_df.write_csv(preprocessed_output_path)
+                preprocessed_df_to_save.write_csv(preprocessed_output_path)
             elif output_format == "parquet":
-                preprocessed_df.write_parquet(preprocessed_output_path)
+                preprocessed_df_to_save.write_parquet(preprocessed_output_path)
             logging.info(
                 f"成功！已保存预处理对比文件到: {preprocessed_output_path}"
             )
@@ -1089,17 +1093,13 @@ def process_flight_data(
             logging.warning("最终平滑处理后没有可保存的数据。")
         else:
             # --- 第五阶段 (新增): 全局零容忍最终验证 ---
-            # 这是写入文件前的最后一道关卡，确保100%的数据纯净性。
             logging.info("--- 阶段五: 正在执行全局零容忍最终验证... ---")
 
             # 1. 识别含有null值的轨迹
             key_cols_final_check = ["Lon", "Lat", "H"]
-
-            # 创建一个布尔列，如果任何关键列为null，则为True
             is_contaminated_expr = pl.any_horizontal(
                 [pl.col(c).is_null() for c in key_cols_final_check]
             )
-
             contaminated_ids_df = (
                 final_concat_df.filter(is_contaminated_expr)
                 .select("Unique_ID")
@@ -1114,8 +1114,6 @@ def process_flight_data(
                         f"轨迹ID '{traj_id}' 在完成所有处理步骤后，仍检测到残留的缺失值，已被强制丢弃。"
                         " 这强烈表明上游处理流程中存在未被覆盖的边缘案例，需要人工介入检查。"
                     )
-
-                # 从主数据集中移除这些轨迹
                 final_pure_df = final_concat_df.filter(
                     ~pl.col("Unique_ID").is_in(contaminated_ids)
                 )
@@ -1130,20 +1128,23 @@ def process_flight_data(
             if final_pure_df.is_empty():
                 logging.warning("最终验证后，没有剩余的纯净轨迹可供保存。")
             else:
-                final_df = final_pure_df.with_columns(
+                # --- 合并元数据 ---
+                final_full_df = final_pure_df.join(metadata_df, on="Unique_ID", how="left")
+                
+                # --- 全局填充 ---
+                final_full_df = final_full_df.with_columns(
+                    pl.col("GP").forward_fill().backward_fill().over("P1")
+                )
+
+                final_df_to_save = final_full_df.with_columns(
                     Time=pl.col("Time").dt.strftime("%Y%m%d %H:%M:%S%.3f")
                 ).select(
                     pl.col("Unique_ID").alias("ID"),
-                    "PARTNO",
-                    "P1",
-                    "GP",
-                    pl.col("H"),
+                    "PARTNO", "P1", "GP", "H",
                     pl.col("Lon").alias("JD"),
                     pl.col("Lat").alias("WD"),
                     pl.col("track").alias("Heading"),
-                    "TASK",
-                    "PLANETYPE",
-                    pl.col("Time"),
+                    "TASK", "PLANETYPE", "Time",
                 )
                 output_filename = (
                     f"final_processed_trajectories.{output_format}"
@@ -1151,12 +1152,12 @@ def process_flight_data(
                 output_path = os.path.join(output_dir, output_filename)
                 try:
                     if output_format == "csv":
-                        final_df.write_csv(output_path)
+                        final_df_to_save.write_csv(output_path)
                     elif output_format == "parquet":
-                        final_df.write_parquet(output_path)
+                        final_df_to_save.write_parquet(output_path)
 
                     logging.info(
-                        f"成功！已保存 {final_df['ID'].n_unique()} 条通过最终验证的轨迹到 {output_path}"
+                        f"成功！已保存 {final_df_to_save['ID'].n_unique()} 条通过最终验证的轨迹到 {output_path}"
                     )
                 except Exception as e:
                     logging.error(f"保存最终文件到 {output_path} 时失败: {e}")
