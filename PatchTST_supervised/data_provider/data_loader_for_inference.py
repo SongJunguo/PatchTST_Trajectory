@@ -71,52 +71,45 @@ class Dataset_Flight_Inference(Dataset):
         else:
             df_full = pd.read_csv(file_path)
 
-        # --- 特征选择 ---
-        # 获取除ID和Time之外的所有数值列
-        cols = list(df_full.columns)
-        non_feature_cols = ['ID', 'Time', 'PARTNO', 'P1', 'GP', 'TASK', 'PLANETYPE']
-        feature_cols = [c for c in cols if c not in non_feature_cols]
-
-        if self.features == 'M':
-            cols_data = feature_cols
-        elif self.features == 'S':
-            cols_data = [self.target]
-        else: # MS
-            cols_data = feature_cols
-
-        df_data = df_full[cols_data].copy()
+        # --- 兼容层：处理 JD/WD 和 Lon/Lat 列名不一致的问题 ---
+        rename_map = {}
+        if 'JD' in df_full.columns and 'Lon' not in df_full.columns:
+            rename_map['JD'] = 'Lon'
+        if 'WD' in df_full.columns and 'Lat' not in df_full.columns:
+            rename_map['WD'] = 'Lat'
         
-        # --- 标准化（优化：使用float32减少内存使用） ---
+        if rename_map:
+            df_full.rename(columns=rename_map, inplace=True)
+            print(f"为兼容旧数据格式，已执行列名重命名: {rename_map}")
+
+        # --- 标准化与特征选择 (统一逻辑) ---
+        if not (self.stats_path and os.path.exists(self.stats_path)):
+            raise FileNotFoundError(f"归一化统计文件未找到或未提供路径: {self.stats_path}")
+
+        # 1. 从统计文件加载权威的特征列表
+        stats_df = pd.read_csv(self.stats_path)
+        stats_features = list(stats_df['feature'])
+        print(f"从统计文件加载的权威特征列表: {stats_features}")
+
+        # 2. 检查数据文件中是否包含所有需要的特征
+        missing_features = [f for f in stats_features if f not in df_full.columns]
+        if missing_features:
+            raise ValueError(f"数据文件 {self.data_path} (或重命名后) 缺少以下必要的特征: {missing_features}")
+
+        # 3. 【核心】直接根据统计文件的特征列表来选择数据
+        df_data = df_full[stats_features].copy()
+        print(f"已根据统计文件成功筛选出特征列: {list(df_data.columns)}")
+
+        # 4. 根据 scale 参数决定是否进行归一化
         self.scaler = StandardScaler()
         if self.scale:
-            if not (self.stats_path and os.path.exists(self.stats_path)):
-                raise FileNotFoundError(f"归一化统计文件未找到或未提供路径: {self.stats_path}")
-
-            # 1. 加载训练时的统计数据
-            stats_df = pd.read_csv(self.stats_path)
-            stats_features = list(stats_df['feature'])
-            print(f"从统计文件加载的特征顺序: {stats_features}")
-            print(f"从数据文件加载的特征顺序: {list(df_data.columns)}")
-
-            # 2. 检查特征数量是否匹配
-            if len(df_data.columns) != len(stats_features):
-                raise ValueError(f"数据文件和统计文件的特征数量不匹配! 数据列: {len(df_data.columns)}, 统计文件列: {len(stats_features)}")
-
-            # 3. 启发式重命名：假设顺序一致，将数据列重命名为统计文件中的列名
-            column_mapping = dict(zip(df_data.columns, stats_features))
-            df_data.rename(columns=column_mapping, inplace=True)
-            print(f"应用列名映射: {column_mapping}")
-
-            # 4. 确保最终的列顺序与统计文件严格一致
-            df_data = df_data[stats_features]
-
-            # 5. 设置scaler并转换数据
             self.scaler.mean_ = stats_df['mean'].values
             self.scaler.scale_ = stats_df['std'].values
             print(f"成功从 {self.stats_path} 加载并应用归一化统计信息。")
-            
             data = self.scaler.transform(df_data.values.astype(np.float32))
         else:
+            # 如果不归一化，也使用正确选择的特征，但只取其原始值
+            print("scale=False，跳过归一化步骤。")
             data = df_data.values.astype(np.float32)
 
         # --- 时间特征编码 ---
@@ -165,8 +158,6 @@ class Dataset_Flight_Inference(Dataset):
             first_row = group.iloc[0]
             meta_group = {
                 'ID': name,
-                'TASK': first_row['TASK'],
-                'PLANETYPE': first_row['PLANETYPE'],
                 'Time': group['Time'].values # 存储整个轨迹的时间戳
             }
 
@@ -205,9 +196,7 @@ class Dataset_Flight_Inference(Dataset):
 
         meta_info = {
             'Pred_trajectory_id': traj_meta['ID'],
-            'prediction_anchor_time': prediction_anchor_time,
-            'TASK': traj_meta['TASK'],
-            'PLANETYPE': traj_meta['PLANETYPE']
+            'prediction_anchor_time': prediction_anchor_time
         }
 
         # 6. 🚀 优化：使用预分配的全局零数组，避免重复创建

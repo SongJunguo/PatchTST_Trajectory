@@ -13,6 +13,41 @@
 # 脚本应从项目根目录 (PatchTST/) 运行。
 clear
 
+# --- 激活 conda 虚拟环境 ---
+echo "--- 激活 conda 虚拟环境 traffic ---"
+
+# 初始化 conda（如果尚未初始化）
+if [ -f "/opt/miniconda3/etc/profile.d/conda.sh" ]; then
+    source "/opt/miniconda3/etc/profile.d/conda.sh"
+elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+    source "$HOME/miniconda3/etc/profile.d/conda.sh"
+elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+    source "$HOME/anaconda3/etc/profile.d/conda.sh"
+elif [ -f "/opt/conda/etc/profile.d/conda.sh" ]; then
+    source "/opt/conda/etc/profile.d/conda.sh"
+else
+    echo "警告: 未找到 conda 初始化脚本，尝试使用 conda init..."
+    # 尝试运行 conda init
+    if command -v conda &> /dev/null; then
+        eval "$(conda shell.bash hook)"
+    else
+        echo "❌ 无法找到 conda 命令，请检查 conda 安装"
+        exit 1
+    fi
+fi
+
+# 激活 traffic 虚拟环境
+conda activate traffic
+
+# 检查激活是否成功
+if [ "$CONDA_DEFAULT_ENV" = "traffic" ]; then
+    echo "✓ 成功激活 conda 虚拟环境: $CONDA_DEFAULT_ENV"
+else
+    echo "❌ 激活 conda 虚拟环境失败，当前环境: $CONDA_DEFAULT_ENV"
+    echo "请确保已创建名为 'traffic' 的 conda 虚拟环境"
+    exit 1
+fi
+
 # --- 可配置参数 ---
 
 # 1. 输入和输出目录 (路径相对于项目根目录)
@@ -23,7 +58,7 @@ OUTPUT_DIR="./PatchTST_supervised/dataset/processed_for_web/"
 
 # 2. 并行处理的工作进程数
 #    建议设置为您的CPU核心数。
-MAX_WORKERS=16
+MAX_WORKERS=2
 
 # 3. 输出格式
 #    可选项: 'csv' 或 'parquet'。Parquet 格式更高效，推荐使用。

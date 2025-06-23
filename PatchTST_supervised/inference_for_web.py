@@ -156,9 +156,7 @@ class Exp_Inference(Exp_Main):
                         'JD_predicted': sample_preds[:, 1],
                         'WD_predicted': sample_preds[:, 2],
                         'Pred_trajectory_id': [meta_info['Pred_trajectory_id'][j]] * pred_len,
-                        'prediction_anchor_time': [meta_info['prediction_anchor_time'][j]] * pred_len,
-                        'TASK': [meta_info['TASK'][j]] * pred_len,
-                        'PLANETYPE': [meta_info['PLANETYPE'][j]] * pred_len
+                        'prediction_anchor_time': [meta_info['prediction_anchor_time'][j]] * pred_len
                     }
                     batch_results.append(sample_result)
 
@@ -170,9 +168,7 @@ class Exp_Inference(Exp_Main):
                         'JD_predicted': np.concatenate([r['JD_predicted'] for r in batch_results]),
                         'WD_predicted': np.concatenate([r['WD_predicted'] for r in batch_results]),
                         'Pred_trajectory_id': [item for r in batch_results for item in r['Pred_trajectory_id']],
-                        'prediction_anchor_time': [item for r in batch_results for item in r['prediction_anchor_time']],
-                        'TASK': [item for r in batch_results for item in r['TASK']],
-                        'PLANETYPE': [item for r in batch_results for item in r['PLANETYPE']]
+                        'prediction_anchor_time': [item for r in batch_results for item in r['prediction_anchor_time']]
                     }
 
                     # 一次性创建DataFrame
@@ -207,13 +203,11 @@ class Exp_Inference(Exp_Main):
         
         # 调整列顺序
         final_results_df = final_results_df[[
-            'Pred_trajectory_id', 
-            'prediction_anchor_time', 
-            'H_predicted', 
-            'JD_predicted', 
-            'WD_predicted', 
-            'TASK', 
-            'PLANETYPE'
+            'Pred_trajectory_id',
+            'prediction_anchor_time',
+            'H_predicted',
+            'JD_predicted',
+            'WD_predicted'
         ]]
 
         # 结果保存
