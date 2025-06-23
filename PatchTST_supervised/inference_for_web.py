@@ -104,8 +104,12 @@ class Exp_Inference(Exp_Main):
 
             self.model.load_state_dict(state_dict)
 
-        results_list = []
         self.model.eval()
+
+        # 🚀 性能优化：初始化列表以收集NumPy数组
+        all_preds = []
+        all_ids = []
+        all_timestamps = []
 
         # 🚀 性能监控
         import time
@@ -118,74 +122,35 @@ class Exp_Inference(Exp_Main):
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark, meta_info) in enumerate(tqdm(pred_loader, desc="进行预测")):
                 batch_start = time.time()
-                # 使用非阻塞传输，提高GPU利用率
+                
                 batch_x = batch_x.float().to(self.device, non_blocking=True)
                 batch_x_mark = batch_x_mark.float().to(self.device, non_blocking=True)
 
-                # PatchTST模型只需要输入序列
                 outputs = self.model(batch_x)
 
-                # 反归一化 - 处理3D数组
-                outputs_np = outputs.detach().cpu().numpy()  # [batch_size, pred_len, num_features]
+                outputs_np = outputs.detach().cpu().numpy()
                 batch_size, pred_len, num_features = outputs_np.shape
 
-                # 重塑为2D进行反归一化
-                outputs_2d = outputs_np.reshape(-1, num_features)  # [batch_size * pred_len, num_features]
+                if batch_size == 0:
+                    continue
+
+                outputs_2d = outputs_np.reshape(-1, num_features)
                 outputs_2d = pred_data.inverse_transform(outputs_2d)
-
-                # 重塑回3D
-                outputs = outputs_2d.reshape(batch_size, pred_len, num_features)
                 
-                # 🚀 优化：批量处理，避免逐个创建DataFrame
-                batch_size = outputs.shape[0]
+                # 直接收集反归一化后的预测结果
+                all_preds.append(outputs_2d)
+                
+                # 收集对应的元数据
+                all_ids.extend(meta_info['Pred_trajectory_id'])
+                all_timestamps.extend(meta_info['prediction_anchor_time'])
 
-                # 批量重塑预测结果：[batch_size, pred_len, num_features] -> [batch_size * pred_len, num_features]
-                outputs_flat = outputs.reshape(-1, outputs.shape[-1])  # [batch_size * pred_len, 3]
-
-                # 批量创建基础数据
-                batch_results = []
-                for j in range(batch_size):
-                    # 提取当前样本的预测结果
-                    start_idx = j * pred_len
-                    end_idx = start_idx + pred_len
-                    sample_preds = outputs_flat[start_idx:end_idx]
-
-                    # 创建当前样本的结果字典（避免DataFrame创建）
-                    sample_result = {
-                        'H_predicted': sample_preds[:, 0],
-                        'JD_predicted': sample_preds[:, 1],
-                        'WD_predicted': sample_preds[:, 2],
-                        'Pred_trajectory_id': [meta_info['Pred_trajectory_id'][j]] * pred_len,
-                        'prediction_anchor_time': [meta_info['prediction_anchor_time'][j]] * pred_len
-                    }
-                    batch_results.append(sample_result)
-
-                # 批量创建DataFrame（一次性操作）
-                if batch_results:
-                    # 合并所有样本的数据
-                    combined_data = {
-                        'H_predicted': np.concatenate([r['H_predicted'] for r in batch_results]),
-                        'JD_predicted': np.concatenate([r['JD_predicted'] for r in batch_results]),
-                        'WD_predicted': np.concatenate([r['WD_predicted'] for r in batch_results]),
-                        'Pred_trajectory_id': [item for r in batch_results for item in r['Pred_trajectory_id']],
-                        'prediction_anchor_time': [item for r in batch_results for item in r['prediction_anchor_time']]
-                    }
-
-                    # 一次性创建DataFrame
-                    batch_df = pd.DataFrame(combined_data)
-                    results_list.append(batch_df)
-
-                # 记录批次处理时间
                 batch_end = time.time()
-                batch_time = batch_end - batch_start
-                batch_times.append(batch_time)
+                batch_times.append(batch_end - batch_start)
 
-                # 每10个批次输出一次性能统计
                 if (i + 1) % 10 == 0:
                     avg_batch_time = sum(batch_times[-10:]) / min(10, len(batch_times))
                     print(f"批次 {i+1}/{total_batches}, 平均批次时间: {avg_batch_time:.3f}s")
 
-        # 输出总体性能统计
         total_time = time.time() - overall_start
         avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
         print(f"\n🚀 性能统计:")
@@ -194,12 +159,29 @@ class Exp_Inference(Exp_Main):
         print(f"  吞吐量: {total_batches/total_time:.2f} batches/s")
         print(f"  样本吞吐量: {total_batches*self.args.batch_size/total_time:.2f} samples/s")
 
-        if not results_list:
+        if not all_preds:
             print("警告：没有生成任何预测结果。")
             return
 
-        # 合并所有结果并保存
-        final_results_df = pd.concat(results_list, ignore_index=True)
+        # 🚀 性能优化：一次性构建最终的DataFrame
+        print("正在合并所有批次的结果...")
+        # 1. 合并所有预测结果
+        final_preds = np.concatenate(all_preds, axis=0)
+
+        # 2. 扩展元数据以匹配预测结果的维度
+        #    每个样本(ID)对应 pred_len 个预测点
+        pred_len = self.args.pred_len
+        final_ids = np.repeat(all_ids, pred_len)
+        final_timestamps = np.repeat(all_timestamps, pred_len)
+
+        # 3. 一次性创建DataFrame
+        final_results_df = pd.DataFrame({
+            'Pred_trajectory_id': final_ids,
+            'prediction_anchor_time': final_timestamps,
+            'H_predicted': final_preds[:, 0],
+            'JD_predicted': final_preds[:, 1],
+            'WD_predicted': final_preds[:, 2]
+        })
         
         # 调整列顺序
         final_results_df = final_results_df[[
