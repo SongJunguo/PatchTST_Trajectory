@@ -21,11 +21,48 @@ import numpy as np
 import pandas as pd
 import argparse
 from tqdm import tqdm
+import queue
+import threading
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # 导入我们自定义的推理数据加载器
 from data_provider.data_loader_for_inference import Dataset_Flight_Inference
 # 导入主要的实验类，我们将继承它
 from exp.exp_main import Exp_Main
+
+# 🚀 非阻塞式Parquet写入器
+class ParquetWriterThread(threading.Thread):
+    def __init__(self, file_path, schema):
+        super().__init__()
+        self.queue = queue.Queue(maxsize=10)  # 设置缓冲区大小，防止内存无限增长
+        self.file_path = file_path
+        self.schema = schema
+        self.writer = None
+        self._stop_event = threading.Event()
+
+    def run(self):
+        self.writer = pq.ParquetWriter(self.file_path, self.schema, compression='zstd')
+        while not self._stop_event.is_set() or not self.queue.empty():
+            try:
+                # 设置超时，以便能定期检查停止信号
+                batch_df = self.queue.get(timeout=0.1)
+                if batch_df is None:  # 哨兵值，表示结束
+                    break
+                table = pa.Table.from_pandas(batch_df, schema=self.schema, preserve_index=False)
+                self.writer.write_table(table)
+                self.queue.task_done()
+            except queue.Empty:
+                continue
+        self.writer.close()
+
+    def add_batch(self, batch_df):
+        if not self._stop_event.is_set():
+            self.queue.put(batch_df)
+
+    def close(self):
+        self.queue.put(None)  # 发送哨兵值
+        self.join()           # 等待线程结束
 
 class Exp_Inference(Exp_Main):
     def __init__(self, args):
@@ -106,102 +143,95 @@ class Exp_Inference(Exp_Main):
 
         self.model.eval()
 
-        # 🚀 性能优化：初始化列表以收集NumPy数组
-        all_preds = []
-        all_ids = []
-        all_timestamps = []
-
-        # 🚀 性能监控
-        import time
-        total_batches = len(pred_loader)
-        print(f"开始推理，共 {total_batches} 个批次，批次大小: {self.args.batch_size}")
-
-        overall_start = time.time()
-        batch_times = []
-
-        with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark, meta_info) in enumerate(tqdm(pred_loader, desc="进行预测")):
-                batch_start = time.time()
-                
-                batch_x = batch_x.float().to(self.device, non_blocking=True)
-                batch_x_mark = batch_x_mark.float().to(self.device, non_blocking=True)
-
-                outputs = self.model(batch_x)
-
-                outputs_np = outputs.detach().cpu().numpy()
-                batch_size, pred_len, num_features = outputs_np.shape
-
-                if batch_size == 0:
-                    continue
-
-                outputs_2d = outputs_np.reshape(-1, num_features)
-                outputs_2d = pred_data.inverse_transform(outputs_2d)
-                
-                # 直接收集反归一化后的预测结果
-                all_preds.append(outputs_2d)
-                
-                # 收集对应的元数据
-                all_ids.extend(meta_info['Pred_trajectory_id'])
-                all_timestamps.extend(meta_info['prediction_anchor_time'])
-
-                batch_end = time.time()
-                batch_times.append(batch_end - batch_start)
-
-                if (i + 1) % 10 == 0:
-                    avg_batch_time = sum(batch_times[-10:]) / min(10, len(batch_times))
-                    print(f"批次 {i+1}/{total_batches}, 平均批次时间: {avg_batch_time:.3f}s")
-
-        total_time = time.time() - overall_start
-        avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
-        print(f"\n🚀 性能统计:")
-        print(f"  总推理时间: {total_time:.2f}s")
-        print(f"  平均批次时间: {avg_batch_time:.3f}s")
-        print(f"  吞吐量: {total_batches/total_time:.2f} batches/s")
-        print(f"  样本吞吐量: {total_batches*self.args.batch_size/total_time:.2f} samples/s")
-
-        if not all_preds:
-            print("警告：没有生成任何预测结果。")
-            return
-
-        # 🚀 性能优化：一次性构建最终的DataFrame
-        print("正在合并所有批次的结果...")
-        # 1. 合并所有预测结果
-        final_preds = np.concatenate(all_preds, axis=0)
-
-        # 2. 扩展元数据以匹配预测结果的维度
-        #    每个样本(ID)对应 pred_len 个预测点
-        pred_len = self.args.pred_len
-        final_ids = np.repeat(all_ids, pred_len)
-        final_timestamps = np.repeat(all_timestamps, pred_len)
-
-        # 3. 一次性创建DataFrame
-        final_results_df = pd.DataFrame({
-            'Pred_trajectory_id': final_ids,
-            'prediction_anchor_time': final_timestamps,
-            'H_predicted': final_preds[:, 0],
-            'JD_predicted': final_preds[:, 1],
-            'WD_predicted': final_preds[:, 2]
-        })
-        
-        # 调整列顺序
-        final_results_df = final_results_df[[
-            'Pred_trajectory_id',
-            'prediction_anchor_time',
-            'H_predicted',
-            'JD_predicted',
-            'WD_predicted'
-        ]]
-
-        # 结果保存
+        # 结果保存路径
         folder_path = './results/' + setting + '/'
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
-        
         output_path = os.path.join(folder_path, 'prediction_results.parquet')
-        final_results_df.to_parquet(output_path, index=False, compression='zstd')
-        
+
+        # 定义Parquet文件的Schema
+        schema = pa.schema([
+            pa.field('Pred_trajectory_id', pa.string()),
+            pa.field('prediction_anchor_time', pa.timestamp('ms')),
+            pa.field('H_predicted', pa.float32()),
+            pa.field('JD_predicted', pa.float32()),
+            pa.field('WD_predicted', pa.float32())
+        ])
+
+        # 初始化并启动写入线程
+        writer_thread = ParquetWriterThread(output_path, schema)
+        writer_thread.start()
+
+        total_rows_written = 0
+        processed_ids = set()
+
+        # 性能监控
+        import time
+        total_batches = len(pred_loader)
+        print(f"开始推理，共 {total_batches} 个批次，批次大小: {self.args.batch_size}")
+        overall_start = time.time()
+        batch_times = []
+
+        try:
+            with torch.no_grad():
+                for i, (batch_x, batch_y, batch_x_mark, batch_y_mark, meta_info) in enumerate(tqdm(pred_loader, desc="进行预测")):
+                    batch_start = time.time()
+                    
+                    batch_x = batch_x.float().to(self.device, non_blocking=True)
+                    batch_x_mark = batch_x_mark.float().to(self.device, non_blocking=True)
+
+                    outputs = self.model(batch_x)
+                    outputs_np = outputs.detach().cpu().numpy()
+                    batch_size, pred_len, num_features = outputs_np.shape
+
+                    if batch_size == 0:
+                        continue
+
+                    outputs_2d = outputs_np.reshape(-1, num_features)
+                    outputs_2d = pred_data.inverse_transform(outputs_2d)
+                    
+                    # 扩展元数据
+                    ids = np.repeat(meta_info['Pred_trajectory_id'], pred_len)
+                    timestamps = np.repeat(meta_info['prediction_anchor_time'], pred_len)
+
+                    # 创建当前批次的DataFrame
+                    batch_df = pd.DataFrame({
+                        'Pred_trajectory_id': ids,
+                        'prediction_anchor_time': pd.to_datetime(timestamps),
+                        'H_predicted': outputs_2d[:, 0].astype('float32'),
+                        'JD_predicted': outputs_2d[:, 1].astype('float32'),
+                        'WD_predicted': outputs_2d[:, 2].astype('float32')
+                    })
+
+                    # 将批次数据放入队列，由后台线程写入
+                    writer_thread.add_batch(batch_df)
+
+                    total_rows_written += len(batch_df)
+                    processed_ids.update(meta_info['Pred_trajectory_id'])
+
+                    batch_end = time.time()
+                    batch_times.append(batch_end - batch_start)
+
+                    if (i + 1) % 10 == 0:
+                        avg_batch_time = sum(batch_times[-10:]) / min(10, len(batch_times))
+                        print(f"批次 {i+1}/{total_batches}, 平均批次时间: {avg_batch_time:.3f}s, 队列大小: {writer_thread.queue.qsize()}")
+
+            total_time = time.time() - overall_start
+            avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
+            print(f"\n🚀 性能统计:")
+            print(f"  总推理时间: {total_time:.2f}s")
+            print(f"  平均批次时间: {avg_batch_time:.3f}s")
+            print(f"  吞吐量: {total_batches/total_time:.2f} batches/s")
+            print(f"  样本吞吐量: {total_batches*self.args.batch_size/total_time:.2f} samples/s")
+
+        finally:
+            # 确保无论成功还是失败，都关闭写入线程
+            print("推理循环结束，正在等待所有数据写入磁盘...")
+            writer_thread.close()
+            print("写入完成。")
+
         print(f"预测完成！结果已保存到: {output_path}")
-        print(f"总共为 {final_results_df['Pred_trajectory_id'].nunique()} 条轨迹生成了 {len(final_results_df)} 个预测点。")
+        print(f"总共为 {len(processed_ids)} 条轨迹生成了 {total_rows_written} 个预测点。")
 
         return
 
