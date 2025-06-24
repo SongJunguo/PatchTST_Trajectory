@@ -51,7 +51,7 @@ def data_provider(args, flag):
         num_workers=args.num_workers,
         drop_last=drop_last,
         pin_memory=True,  # 加速GPU数据传输
-        persistent_workers=False,  # 禁用persistent_workers以避免潜在的内存泄漏
+        persistent_workers=True,  # 启用以在epochs之间保持worker进程，极大加速
         prefetch_factor=2 if args.num_workers > 0 else 2  # 预取更多批次
     )
     return data_set, data_loader

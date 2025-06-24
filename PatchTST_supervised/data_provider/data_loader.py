@@ -100,19 +100,18 @@ class Dataset_ETT_hour(Dataset):
 
 
 class Dataset_Flight(Dataset):
+    _processed_data_cache = None
+    _scaler_cache = None
+
     def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
                  target='OT', scale=True, timeenc=0, freq='h', train_test_split=[0.7, 0.15, 0.15]):
         # size [seq_len, label_len, pred_len]
-        # info
-        if size == None:
-            self.seq_len = 24 * 4 * 4
-            self.label_len = 24 * 4
-            self.pred_len = 24 * 4
+        if size is None:
+            self.seq_len, self.label_len, self.pred_len = 24 * 4 * 4, 24 * 4, 24 * 4
         else:
-            self.seq_len = size[0]
-            self.label_len = size[1]
-            self.pred_len = size[2]
+            self.seq_len, self.label_len, self.pred_len = size[0], size[1], size[2]
+        
         # init
         assert flag in ['train', 'test', 'val']
         type_map = {'train': 0, 'val': 1, 'test': 2}
@@ -123,129 +122,144 @@ class Dataset_Flight(Dataset):
         self.scale = scale
         self.timeenc = timeenc
         self.freq = freq
-        self.train_test_split = train_test_split
 
-        self.root_path = root_path
-        self.data_path = data_path
-        self.__read_data__()
+        # Trigger one-time data loading and preprocessing
+        if Dataset_Flight._processed_data_cache is None:
+            Dataset_Flight._load_and_cache_data(root_path, data_path, features, target, scale, timeenc, freq, train_test_split, size)
 
-    def __read_data__(self):
-        self.scaler = StandardScaler()
-        df_full = pd.read_csv(os.path.join(self.root_path,
-                                          self.data_path))
+        # Assign data from cache
+        processed_data = Dataset_Flight._processed_data_cache[flag]
+        self.scaler = Dataset_Flight._scaler_cache
+        
+        self.data_x = processed_data['data_x']
+        self.data_y = processed_data['data_y']
+        self.data_stamp = processed_data['data_stamp']
+        self.index_mapping = processed_data['index_mapping']
 
-        # Splitting data by ID
+    @staticmethod
+    def _load_and_cache_data(root_path, data_path, features, target, scale, timeenc, freq, train_test_split, size):
+        print("--- Starting one-time data loading and preprocessing for Dataset_Flight ---")
+        
+        if size is None:
+            seq_len, label_len, pred_len = 24 * 4 * 4, 24 * 4, 24 * 4
+        else:
+            seq_len, label_len, pred_len = size[0], size[1], size[2]
+
+        # 1. Read CSV with optimized dtype
+        full_path = os.path.join(root_path, data_path)
+        try:
+            temp_df = pd.read_csv(full_path, nrows=0)
+        except FileNotFoundError:
+            print(f"Error: Data file not found at {full_path}")
+            raise
+            
+        float_cols = [c for c in temp_df.columns if temp_df[c].dtype == 'float64' or c not in ['ID', 'Time']]
+        dtype_map = {c: np.float32 for c in float_cols}
+        
+        df_full = pd.read_csv(full_path, dtype=dtype_map)
+        print(f"Successfully loaded '{data_path}' with memory-optimized dtypes.")
+
+        # 2. Split IDs for train/val/test
         unique_ids = df_full['ID'].unique()
+        np.random.seed(2021) # set seed for reproducibility
         np.random.shuffle(unique_ids)
 
-        train_split = self.train_test_split[0]
-        val_split = self.train_test_split[1]
-
+        train_split, val_split = train_test_split[0], train_test_split[1]
         num_train = int(len(unique_ids) * train_split)
         num_val = int(len(unique_ids) * val_split)
 
-        train_ids = unique_ids[:num_train]
-        val_ids = unique_ids[num_train:num_train + num_val]
-        test_ids = unique_ids[num_train + num_val:]
+        id_sets = {
+            'train': unique_ids[:num_train],
+            'val': unique_ids[num_train:num_train + num_val],
+            'test': unique_ids[num_train + num_val:]
+        }
 
-        id_sets = [train_ids, val_ids, test_ids]
-        set_ids = id_sets[self.set_type]
+        # 3. Fit Scaler on Training Data
+        scaler = StandardScaler()
+        if scale:
+            cols = [c for c in df_full.columns if c not in ['ID', 'Time']]
+            cols_data = cols if features in ['M', 'MS'] else [target]
+            
+            train_df_for_scaler = df_full[df_full['ID'].isin(id_sets['train'])]
+            train_data_for_scaler = train_df_for_scaler[cols_data].values
+            scaler.fit(train_data_for_scaler)
+            print("Scaler fitted on training data.")
+            # Save normalization stats right after fitting the scaler
+            Dataset_Flight._save_normalization_stats_static(root_path, data_path, cols_data, scaler)
+        
+        # 4. Process each data split
+        all_processed_data = {}
+        for flag, set_ids in id_sets.items():
+            print(f"Processing {flag} data...")
+            
+            df_raw = df_full[df_full['ID'].isin(set_ids)]
+            
+            cols = [c for c in df_full.columns if c not in ['ID', 'Time']]
+            cols_data = cols if features in ['M', 'MS'] else [target]
 
-        # Get feature columns, excluding ID and Time
-        cols = list(df_full.columns)
-        cols.remove('ID')
-        cols.remove('Time')
+            data_x_list, data_y_list, data_stamp_list, index_mapping = [], [], [], []
+            
+            grouped = df_raw.groupby('ID')
+            for traj_idx, (_, group) in enumerate(grouped):
+                df_data = group[cols_data]
+                group_data = scaler.transform(df_data.values) if scale else df_data.values
 
-        if self.features == 'M' or self.features == 'MS':
-            cols_data = cols
-        elif self.features == 'S':
-            cols_data = [self.target]
+                df_stamp_group = group[['Time']].rename(columns={'Time': 'date'})
+                df_stamp_group['date'] = pd.to_datetime(df_stamp_group.date)
+                if timeenc == 0:
+                    df_stamp_group['month'] = df_stamp_group.date.apply(lambda row: row.month, 1)
+                    df_stamp_group['day'] = df_stamp_group.date.apply(lambda row: row.day, 1)
+                    df_stamp_group['weekday'] = df_stamp_group.date.apply(lambda row: row.weekday(), 1)
+                    df_stamp_group['hour'] = df_stamp_group.date.apply(lambda row: row.hour, 1)
+                    stamp_data = df_stamp_group.drop(['date'], axis=1).values
+                elif timeenc == 1:
+                    stamp_data = time_features(pd.to_datetime(df_stamp_group['date'].values), freq=freq).transpose(1, 0)
+                
+                data_x_list.append(group_data)
+                data_y_list.append(group_data)
+                data_stamp_list.append(stamp_data)
 
-        # Fit scaler on training data
-        if self.scale:
-            train_df = df_full[df_full['ID'].isin(train_ids)]
-            train_data = train_df[cols_data]
-            self.scaler.fit(train_data.values)
+                traj_samples = len(group_data) - seq_len - pred_len + 1
+                if traj_samples > 0:
+                    for local_idx in range(traj_samples):
+                        index_mapping.append((traj_idx, local_idx))
 
-            # 保存训练集的归一化统计信息（仅在训练模式下）
-            if self.set_type == 0:  # train mode
-                self._save_normalization_stats(cols_data)
+            all_processed_data[flag] = {
+                'data_x': data_x_list, 'data_y': data_y_list,
+                'data_stamp': data_stamp_list, 'index_mapping': index_mapping
+            }
+            print(f"Finished processing {flag} data. Found {len(index_mapping)} samples.")
 
-        # Filter for the current set (train/val/test)
-        df_raw = df_full[df_full['ID'].isin(set_ids)]
-        df_data = df_raw[cols_data]
+        Dataset_Flight._processed_data_cache = all_processed_data
+        Dataset_Flight._scaler_cache = scaler
+        print("--- Data cached successfully. Subsequent instantiations will be fast. ---")
 
-        if self.scale:
-            data = self.scaler.transform(df_data.values)
-        else:
-            data = df_data.values
+    @staticmethod
+    def _save_normalization_stats_static(root_path, data_path, cols_data, scaler):
+        """
+        保存训练集的归一化统计信息（均值和标准差）到CSV文件
+        用于后续的反归一化操作
+        """
+        stats_dir = os.path.join(root_path, 'normalization_stats')
+        os.makedirs(stats_dir, exist_ok=True)
 
-        df_stamp = df_raw[['Time']]
-        df_stamp.rename(columns={'Time': 'date'}, inplace=True)
-        df_stamp['date'] = pd.to_datetime(df_stamp.date)
-        if self.timeenc == 0:
-            df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
-            df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
-            df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday(), 1)
-            df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
-            data_stamp = df_stamp.drop(['date'], axis=1).values
-        elif self.timeenc == 1:
-            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
-            data_stamp = data_stamp.transpose(1, 0)
+        dataset_name = os.path.splitext(data_path)[0]
+        stats_filename = f"{dataset_name}_normalization_stats.csv"
+        stats_path = os.path.join(stats_dir, stats_filename)
 
-        # 优化：预先计算索引映射，避免在__getitem__中进行线性搜索
-        self.data_x = []
-        self.data_y = []
-        self.data_stamp = []
-        self.index_mapping = []  # 存储(轨迹索引, 轨迹内索引)的映射
+        stats_data = {'feature': cols_data, 'mean': scaler.mean_, 'std': scaler.scale_}
+        stats_df = pd.DataFrame(stats_data)
 
-        current_global_idx = 0
-        grouped = df_raw.groupby('ID')
-        for traj_idx, (_, group) in enumerate(grouped):
-            # Get data for the current group
-            df_data = group[cols_data]
-            if self.scale:
-                group_data = self.scaler.transform(df_data.values)
-            else:
-                group_data = df_data.values
-
-            # Get timestamp data
-            df_stamp_group = group[['Time']]
-            df_stamp_group.rename(columns={'Time': 'date'}, inplace=True)
-            df_stamp_group['date'] = pd.to_datetime(df_stamp_group.date)
-            if self.timeenc == 0:
-                df_stamp_group['month'] = df_stamp_group.date.apply(lambda row: row.month, 1)
-                df_stamp_group['day'] = df_stamp_group.date.apply(lambda row: row.day, 1)
-                df_stamp_group['weekday'] = df_stamp_group.date.apply(lambda row: row.weekday(), 1)
-                df_stamp_group['hour'] = df_stamp_group.date.apply(lambda row: row.hour, 1)
-                stamp_data = df_stamp_group.drop(['date'], axis=1).values
-            elif self.timeenc == 1:
-                stamp_data = time_features(pd.to_datetime(df_stamp_group['date'].values), freq=self.freq)
-                stamp_data = stamp_data.transpose(1, 0)
-
-            # Add trajectory data to lists
-            self.data_x.append(group_data)
-            self.data_y.append(group_data)
-            self.data_stamp.append(stamp_data)
-
-            # 计算该轨迹可以产生的样本数量
-            traj_samples = len(group_data) - self.seq_len - self.pred_len + 1
-            if traj_samples > 0:
-                # 为每个样本创建索引映射
-                for local_idx in range(traj_samples):
-                    self.index_mapping.append((traj_idx, local_idx))
-                    current_global_idx += 1
+        stats_df.to_csv(stats_path, index=False)
+        print(f"Normalization stats saved to: {stats_path}")
 
     def __getitem__(self, index):
-        # 优化：使用预计算的索引映射，O(1)复杂度
         traj_idx, local_idx = self.index_mapping[index]
-
-        # Get the data for the selected trajectory
+        
         traj_data_x = self.data_x[traj_idx]
         traj_data_y = self.data_y[traj_idx]
         traj_data_stamp = self.data_stamp[traj_idx]
 
-        # Get the window
         s_begin = local_idx
         s_end = s_begin + self.seq_len
         r_begin = s_end - self.label_len
@@ -259,40 +273,10 @@ class Dataset_Flight(Dataset):
         return seq_x, seq_y, seq_x_mark, seq_y_mark
 
     def __len__(self):
-        # 优化：直接返回预计算的索引映射长度
         return len(self.index_mapping)
 
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
-
-    def _save_normalization_stats(self, cols_data):
-        """
-        保存训练集的归一化统计信息（均值和标准差）到CSV文件
-        用于后续的反归一化操作
-        """
-        # 创建保存统计信息的目录
-        stats_dir = os.path.join(self.root_path, 'normalization_stats')
-        os.makedirs(stats_dir, exist_ok=True)
-
-        # 获取数据集名称（从data_path中提取）
-        dataset_name = os.path.splitext(self.data_path)[0]
-        stats_filename = f"{dataset_name}_normalization_stats.csv"
-        stats_path = os.path.join(stats_dir, stats_filename)
-
-        # 创建统计信息DataFrame
-        stats_data = {
-            'feature': cols_data,
-            'mean': self.scaler.mean_,
-            'std': self.scaler.scale_
-        }
-        stats_df = pd.DataFrame(stats_data)
-
-        # 保存到CSV文件
-        stats_df.to_csv(stats_path, index=False)
-        print(f"归一化统计信息已保存到: {stats_path}")
-        print(f"特征数量: {len(cols_data)}")
-        print(f"统计信息预览:")
-        print(stats_df.head())
 
 
 class Dataset_ETT_minute(Dataset):

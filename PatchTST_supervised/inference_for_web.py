@@ -21,8 +21,6 @@ import numpy as np
 import pandas as pd
 import argparse
 from tqdm import tqdm
-import queue
-import threading
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -30,39 +28,6 @@ import pyarrow.parquet as pq
 from data_provider.data_loader_for_inference import Dataset_Flight_Inference
 # 导入主要的实验类，我们将继承它
 from exp.exp_main import Exp_Main
-
-# 🚀 非阻塞式Parquet写入器
-class ParquetWriterThread(threading.Thread):
-    def __init__(self, file_path, schema):
-        super().__init__()
-        self.queue = queue.Queue(maxsize=10)  # 设置缓冲区大小，防止内存无限增长
-        self.file_path = file_path
-        self.schema = schema
-        self.writer = None
-        self._stop_event = threading.Event()
-
-    def run(self):
-        self.writer = pq.ParquetWriter(self.file_path, self.schema, compression='zstd')
-        while not self._stop_event.is_set() or not self.queue.empty():
-            try:
-                # 设置超时，以便能定期检查停止信号
-                batch_df = self.queue.get(timeout=0.1)
-                if batch_df is None:  # 哨兵值，表示结束
-                    break
-                table = pa.Table.from_pandas(batch_df, schema=self.schema, preserve_index=False)
-                self.writer.write_table(table)
-                self.queue.task_done()
-            except queue.Empty:
-                continue
-        self.writer.close()
-
-    def add_batch(self, batch_df):
-        if not self._stop_event.is_set():
-            self.queue.put(batch_df)
-
-    def close(self):
-        self.queue.put(None)  # 发送哨兵值
-        self.join()           # 等待线程结束
 
 class Exp_Inference(Exp_Main):
     def __init__(self, args):
@@ -158,9 +123,8 @@ class Exp_Inference(Exp_Main):
             pa.field('WD_predicted', pa.float32())
         ])
 
-        # 初始化并启动写入线程
-        writer_thread = ParquetWriterThread(output_path, schema)
-        writer_thread.start()
+        # 初始化Parquet写入器
+        writer = pq.ParquetWriter(output_path, schema, compression='zstd', version='1.0')
 
         total_rows_written = 0
         processed_ids = set()
@@ -203,8 +167,9 @@ class Exp_Inference(Exp_Main):
                         'WD_predicted': outputs_2d[:, 2].astype('float32')
                     })
 
-                    # 将批次数据放入队列，由后台线程写入
-                    writer_thread.add_batch(batch_df)
+                    # 直接写入文件
+                    table = pa.Table.from_pandas(batch_df, schema=schema, preserve_index=False)
+                    writer.write_table(table)
 
                     total_rows_written += len(batch_df)
                     processed_ids.update(meta_info['Pred_trajectory_id'])
@@ -214,7 +179,7 @@ class Exp_Inference(Exp_Main):
 
                     if (i + 1) % 10 == 0:
                         avg_batch_time = sum(batch_times[-10:]) / min(10, len(batch_times))
-                        print(f"批次 {i+1}/{total_batches}, 平均批次时间: {avg_batch_time:.3f}s, 队列大小: {writer_thread.queue.qsize()}")
+                        print(f"批次 {i+1}/{total_batches}, 平均批次时间: {avg_batch_time:.3f}s")
 
             total_time = time.time() - overall_start
             avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
@@ -225,9 +190,9 @@ class Exp_Inference(Exp_Main):
             print(f"  样本吞吐量: {total_batches*self.args.batch_size/total_time:.2f} samples/s")
 
         finally:
-            # 确保无论成功还是失败，都关闭写入线程
-            print("推理循环结束，正在等待所有数据写入磁盘...")
-            writer_thread.close()
+            # 确保无论成功还是失败，都关闭写入器
+            print("推理循环结束，正在关闭文件写入器...")
+            writer.close()
             print("写入完成。")
 
         print(f"预测完成！结果已保存到: {output_path}")
@@ -272,6 +237,7 @@ if __name__ == '__main__':
     parser.add_argument('--kernel_size', type=int, default=25, help='decomposition-kernel')
     parser.add_argument('--individual', type=int, default=1, help='individual head; True 1 False 0')
     parser.add_argument('--embed_type', type=int, default=1, help='0: default 1: value embedding + temporal embedding + positional embedding')
+    parser.add_argument('--embed', type=str, default='timeF', help='time features encoding, options:[timeF, fixed, learned]')
     parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
     parser.add_argument('--batch_size', type=int, default=1024, help='batch size of train input data')
     parser.add_argument('--pin_memory', type=str, default='true', help='enable pin memory for faster GPU transfer')
@@ -316,7 +282,7 @@ if __name__ == '__main__':
         args.d_layers,
         args.d_ff,
         1,  # factor (固定值)
-        'timeF',  # embed (固定值)
+        args.embed,  # embed (固定值)
         True,  # distil (固定值)
         args.des,
         0  # iteration (固定值)

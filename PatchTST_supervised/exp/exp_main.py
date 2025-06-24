@@ -25,6 +25,15 @@ class Exp_Main(Exp_Basic):
     def __init__(self, args):
         super(Exp_Main, self).__init__(args)
 
+        # --- 数据加载优化：在实验初始化时一次性加载并缓存所有数据 ---
+        # 仅当使用我们优化的flight数据集时触发
+        if self.args.data == 'flight' and self.args.is_training:
+            print("Pre-loading and caching data for all sets (train, val, test)...")
+            # 调用_get_data('train')会触发Dataset_Flight中的静态缓存机制，为所有数据集加载数据
+            # 即使只运行测试，这也能确保数据被提前加载。
+            self._get_data(flag='train')
+            print("Data pre-loading complete.")
+
     def _build_model(self):
         model_dict = {
             'Autoformer': Autoformer,

@@ -100,7 +100,7 @@ DEVICES="0"
 # 6. 数据加载优化配置
 PIN_MEMORY=true     # 启用内存锁定，加速GPU数据传输
 PERSISTENT_WORKERS=true  # 保持工作进程存活，减少进程创建开销
-Dataloader_STRIDE=10 # 🚀 新增：数据加载器滑窗步长
+Dataloader_STRIDE=1 # 🚀 新增：数据加载器滑窗步长
  
  # 7. 系统级优化 - 允许更多线程以提高并行度
  export OMP_NUM_THREADS=4        # 允许适量OpenMP线程

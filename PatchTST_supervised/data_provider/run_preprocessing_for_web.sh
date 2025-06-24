@@ -96,7 +96,7 @@ SAVE_DEBUG_FILE="true"
 
 # 10. 重采样频率
 #    可选项: '1s', '2s', '5s'
-RESAMPLE_FREQ="1s"
+RESAMPLE_FREQ="5s"
 
 # 11. 过境航班过滤阈值 (度)
 #    如果航迹的经度或纬度总位移超过此值，则被视为过境航班并被丢弃。
