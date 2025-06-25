@@ -909,6 +909,8 @@ def process_flight_data(
             "Lon",
             "Lat",
             "H",
+            "TASK",
+            "PLANETYPE",
             pl.col("ID").alias("Original_Plane_ID"),  # 保留原始飞机ID以供参考
         )
 
